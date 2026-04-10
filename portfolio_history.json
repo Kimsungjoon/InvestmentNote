@@ -1,0 +1,22 @@
+{
+  "AMZN": {
+    "best_return": 11.54,
+    "best_date": "2026-04-11"
+  },
+  "AVGO": {
+    "best_return": 14.11,
+    "best_date": "2026-04-11"
+  },
+  "PLTR": {
+    "best_return": -12.85,
+    "best_date": "2026-04-11"
+  },
+  "GE": {
+    "best_return": -3.63,
+    "best_date": "2026-04-11"
+  },
+  "VST": {
+    "best_return": -3.24,
+    "best_date": "2026-04-11"
+  }
+}
