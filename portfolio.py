@@ -11,11 +11,10 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 # 보유 주식 설정 (종목명, 티커, 평단가, 수량)
 # ─────────────────────────────────────────────
 PORTFOLIO = [
-    {"name": "아마존닷컴",        "ticker": "AMZN", "avg_price": 213.80, "qty": 7},
-    {"name": "브로드컴",          "ticker": "AVGO", "avg_price": 325.19, "qty": 6},
-    {"name": "팔란티어 테크",     "ticker": "PLTR", "avg_price": 145.51, "qty": 9},
-    {"name": "GE 에어로스페이스", "ticker": "GE",   "avg_price": 319.25, "qty": 4},
-    {"name": "비스트라 에너지",   "ticker": "VST",  "avg_price": 161.69, "qty": 8},
+    {"name": "아마존닷컴",      "ticker": "AMZN", "avg_price": 213.80, "qty": 7},
+    {"name": "브로드컴",        "ticker": "AVGO", "avg_price": 325.19, "qty": 6},
+    {"name": "팔란티어 테크",   "ticker": "PLTR", "avg_price": 140.41, "qty": 14},
+    {"name": "비스트라 에너지", "ticker": "VST",  "avg_price": 161.69, "qty": 8},
 ]
 
 # 매도 알림에서 제외할 티커

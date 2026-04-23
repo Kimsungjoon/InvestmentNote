@@ -11,6 +11,10 @@ on:
   # 수동 실행 버튼 활성화 (GitHub Actions 탭에서 직접 실행 가능)
   workflow_dispatch:
 
+# 레포 쓰기 권한 부여 (파일 커밋 & 푸시에 필요)
+permissions:
+  contents: write
+
 jobs:
   update-portfolio:
     runs-on: ubuntu-latest
