@@ -13,13 +13,13 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 PORTFOLIO = [
     {"name": "아마존닷컴",          "ticker": "AMZN", "avg_price": 213.80, "qty": 7},
     {"name": "브로드컴",            "ticker": "AVGO", "avg_price": 325.19, "qty": 6},
-    {"name": "팔란티어 테크",       "ticker": "PLTR", "avg_price": 145.51, "qty": 9},
-    {"name": "머크",                "ticker": "MRK",  "avg_price": 114.14, "qty": 15},
-    {"name": "다이아몬드백 에너지", "ticker": "FANG", "avg_price": 195.75, "qty": 10},
+    {"name": "팔란티어 테크",       "ticker": "PLTR", "avg_price": 140.66, "qty": 14},
+    {"name": "머크",                "ticker": "MRK",  "avg_price": 114.88, "qty": 15},
+    {"name": "다이아몬드백 에너지", "ticker": "FANG", "avg_price": 197.09, "qty": 10},
 ]
 
 # 매도 알림에서 제외할 티커
-ALERT_EXCLUDE = {"PLTR"}
+ALERT_EXCLUDE = set()
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 BASE_DIR   = Path(__file__).parent
@@ -101,7 +101,10 @@ def fmt_krw(v: float) -> str:
     return f"₩{v:,.0f}" if v >= 0 else f"-₩{abs(v):,.0f}"
 
 def fmt_rate(v: float) -> str:
-    return f"{'+' if v >= 0 else ''}{v:.2f}%"
+    rounded = round(v, 2)
+    if rounded == 0.0:
+        return "0.00%"
+    return f"{'+' if rounded > 0 else ''}{rounded:.2f}%"
 
 def color(text: str, value: float) -> str:
     """양수=빨강, 음수=파랑 (한국 주식 기준). CI 환경에서는 색상 미적용."""
@@ -154,22 +157,25 @@ def save_markdown(results: list, total_cost: float, total_value: float,
     lines.append("")
     lines.append("## 보유 종목별 현황")
     lines.append("")
-    lines.append("| 종목 | 티커 | 평단가 ($) | 현재가 ($) | 손익 ($) | 손익 (₩) | 수익률 |")
-    lines.append("|------|------|----------:|----------:|---------:|---------:|-------:|")
+    lines.append("| 종목 | 티커 | 평단가 ($) | 현재가 ($) | 손익 ($) | 손익 (₩) | 수익률 | 최고수익률 | 고점대비 |")
+    lines.append("|------|------|----------:|----------:|---------:|---------:|-------:|-----------:|---------:|")
 
     for name, tick, avg, price, qty, cost, value, profit, rate, best_return in results:
-        p_str   = f"+${profit:,.2f}"      if profit >= 0 else f"-${abs(profit):,.2f}"
-        pk_str  = f"+₩{profit*krw_rate:,.0f}" if profit >= 0 else f"-₩{abs(profit*krw_rate):,.0f}"
-        r_str   = fmt_rate(rate)
+        p_str    = f"+${profit:,.2f}"          if profit >= 0 else f"-${abs(profit):,.2f}"
+        pk_str   = f"+₩{profit*krw_rate:,.0f}" if profit >= 0 else f"-₩{abs(profit*krw_rate):,.0f}"
+        r_str    = fmt_rate(rate)
+        b_str    = fmt_rate(best_return)
+        diff     = rate - best_return
+        diff_str = fmt_rate(diff)
         lines.append(
             f"| {name} | {tick} | ${avg:,.2f} | ${price:,.2f} "
-            f"| {p_str} | {pk_str} | {r_str} |"
+            f"| {p_str} | {pk_str} | {r_str} | {b_str} | {diff_str} |"
         )
 
     tp_str  = f"+${total_profit:,.2f}"          if total_profit >= 0 else f"-${abs(total_profit):,.2f}"
     tpk_str = f"+₩{total_profit*krw_rate:,.0f}" if total_profit >= 0 else f"-₩{abs(total_profit*krw_rate):,.0f}"
     tr_str  = fmt_rate(total_rate)
-    lines.append(f"| **합계** | | | | **{tp_str}** | **{tpk_str}** | **{tr_str}** |")
+    lines.append(f"| **합계** | | | | **{tp_str}** | **{tpk_str}** | **{tr_str}** | | |")
 
     lines.append("")
     lines.append("---")
@@ -194,11 +200,12 @@ def print_portfolio():
     krw_rate = get_exchange_rate()
     history  = load_history()
 
-    col_w = [16, 6, 10, 10, 12, 14, 9]
+    col_w = [16, 6, 10, 10, 12, 14, 9, 11, 9]
     header = (
         f"  {'종목':<{col_w[0]}} {'티커':<{col_w[1]}} "
         f"{'평단가($)':>{col_w[2]}} {'현재가($)':>{col_w[3]}} "
-        f"{'손익($)':>{col_w[4]}} {'손익(₩)':>{col_w[5]}} {'수익률':>{col_w[6]}}"
+        f"{'손익($)':>{col_w[4]}} {'손익(₩)':>{col_w[5]}} {'수익률':>{col_w[6]}} "
+        f"{'최고수익률':>{col_w[7]}} {'고점대비':>{col_w[8]}}"
     )
     sep = "  " + "─" * (sum(col_w) + len(col_w) + 4)
 
@@ -263,10 +270,14 @@ def print_portfolio():
         rate_str       = color(fmt_rate(rate), rate)
         profit_str     = color(fmt_usd(profit), profit)
         profit_krw_str = color(("+") + fmt_krw(profit_krw) if profit_krw >= 0 else fmt_krw(profit_krw), profit_krw)
+        diff           = rate - best_return
+        best_str       = fmt_rate(best_return)
+        diff_str       = color(fmt_rate(diff), diff)
         print(
             f"  {name:<{col_w[0]}} {tick:<{col_w[1]}} "
             f"{fmt_usd_plain(avg):>{col_w[2]}} {fmt_usd_plain(price):>{col_w[3]}} "
-            f"{profit_str:>{col_w[4]+9}} {profit_krw_str:>{col_w[5]+9}} {rate_str:>{col_w[6]+9}}"
+            f"{profit_str:>{col_w[4]+9}} {profit_krw_str:>{col_w[5]+9}} {rate_str:>{col_w[6]+9}} "
+            f"{best_str:>{col_w[7]}} {diff_str:>{col_w[8]+9}}"
         )
 
     if not results:
@@ -283,7 +294,8 @@ def print_portfolio():
         f"{'':{col_w[2]}} {'':{col_w[3]}} "
         f"{color(fmt_usd(total_profit), total_profit):>{col_w[4]+9}} "
         f"{color(('+' if total_profit_krw >= 0 else '') + fmt_krw(total_profit_krw), total_profit_krw):>{col_w[5]+9}} "
-        f"{color(fmt_rate(total_rate), total_rate):>{col_w[6]+9}}"
+        f"{color(fmt_rate(total_rate), total_rate):>{col_w[6]+9}} "
+        f"{'':{col_w[7]}} {'':{col_w[8]}}"
     )
 
     print()
