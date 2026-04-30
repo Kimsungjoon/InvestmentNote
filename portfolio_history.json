@@ -1,7 +1,7 @@
 {
   "AMZN": {
-    "best_return": 23.48,
-    "best_date": "2026-04-24"
+    "best_return": 23.98,
+    "best_date": "2026-04-30"
   },
   "AVGO": {
     "best_return": 30.0,
@@ -16,7 +16,7 @@
     "best_date": "2026-04-23"
   },
   "FANG": {
-    "best_return": 4.18,
-    "best_date": "2026-04-29"
+    "best_return": 4.33,
+    "best_date": "2026-04-30"
   }
 }
