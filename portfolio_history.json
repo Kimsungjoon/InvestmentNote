@@ -1,22 +1,18 @@
 {
-  "AMZN": {
-    "best_return": 28.62,
-    "best_date": "2026-05-06"
-  },
-  "AVGO": {
-    "best_return": 32.23,
-    "best_date": "2026-05-08"
-  },
-  "PLTR": {
-    "best_return": 3.82,
-    "best_date": "2026-05-04"
-  },
-  "MRK": {
-    "best_return": 0.42,
-    "best_date": "2026-04-23"
+  "STX": {
+    "best_return": 0.0,
+    "best_date": "2026-05-05"
   },
   "FANG": {
     "best_return": 8.42,
     "best_date": "2026-05-04"
+  },
+  "QCOM": {
+    "best_return": 0.0,
+    "best_date": "2026-05-05"
+  },
+  "MRK": {
+    "best_return": 0.42,
+    "best_date": "2026-04-23"
   }
 }
