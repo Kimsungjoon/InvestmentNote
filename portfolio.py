@@ -1,20 +1,21 @@
 import json
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 # GitHub Actions 등 CI 환경에서는 ANSI 색상 비활성화
 IS_CI = os.environ.get("CI", "false").lower() == "true"
 
 # ─────────────────────────────────────────────
-# 보유 주식 설정 (종목명, 티커, 평단가, 수량)
+# 보유 주식 설정 (종목명, 티커, 평단가, 수량, 매수일)
+# buy_date: 실제 매수일로 수정해주세요 (YYYY-MM-DD)
 # ─────────────────────────────────────────────
 PORTFOLIO = [
-    {"name": "씨게이트 테크놀로지", "ticker": "STX",  "avg_price": 786.7625, "qty": 4},
-    {"name": "다이아몬드백 에너지", "ticker": "FANG", "avg_price": 196.1693, "qty": 14},
-    {"name": "퀄컴",               "ticker": "QCOM", "avg_price": 227.3667, "qty": 12},
-    {"name": "머크",               "ticker": "MRK",  "avg_price": 114.5277, "qty": 22},
+    {"name": "로켓랩",           "ticker": "RKLB", "avg_price": 133.4578, "qty": 23, "buy_date": "2026-05-27"},
+    {"name": "아리스타 네트웍스", "ticker": "ANET", "avg_price": 145.2359, "qty": 34, "buy_date": "2026-05-27"},
+    {"name": "버티브 홀딩스",     "ticker": "VRT",  "avg_price": 329.4436, "qty": 14, "buy_date": "2026-05-27"},
+    {"name": "클라우드플레어",    "ticker": "NET",  "avg_price": 212.2794, "qty": 16, "buy_date": "2026-05-27"},
 ]
 
 # 매도 알림에서 제외할 티커
@@ -62,30 +63,67 @@ def update_best_return(history: dict, ticker: str, current_rate: float) -> dict:
     return history
 
 
-def check_alert(ticker: str, name: str, current_rate: float, history: dict) -> str | None:
-    """매도 알림 조건 확인. 해당 없으면 None 반환."""
+def check_sell_alert(ticker: str, name: str, current_rate: float, history: dict) -> list[str]:
+    """손절 알림 조건 확인. 해당 항목 리스트 반환."""
     if ticker in ALERT_EXCLUDE:
-        return None
+        return []
 
     alerts = []
 
-    # 조건 1: 현재 수익률 -10% 이하
-    if current_rate <= -10.0:
-        alerts.append(f"수익률 {fmt_rate(current_rate)} — 손실 -10% 초과")
+    # 조건 1: 현재 수익률 -7% 이하 (기본 손절)
+    if current_rate <= -7.0:
+        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 기본 손절 기준(-7%) 도달")
 
-    # 조건 2: 역대 최고 수익률 대비 -10%p 이상 하락
+    # 조건 2: 역대 최고 수익률 대비 -10%p 이상 하락 (고점 대비 트레일링 스탑)
     if ticker in history:
-        best = history[ticker]["best_return"]
+        best      = history[ticker]["best_return"]
         best_date = history[ticker]["best_date"]
         if current_rate <= best - 10.0:
             alerts.append(
+                f"[{name} / {ticker}]  "
                 f"최고 수익률 {fmt_rate(best)} ({best_date}) 대비 "
-                f"{fmt_rate(current_rate - best)} 하락"
+                f"{fmt_rate(current_rate - best)} 하락 — 고점 대비 손절 기준 도달"
             )
 
-    if alerts:
-        return f"[{name} / {ticker}]  " + " | ".join(alerts)
-    return None
+    return alerts
+
+
+def check_time_stop_alert(ticker: str, name: str, buy_date_str: str, current_rate: float) -> list[str]:
+    """시간 손절 알림: 매수 후 21일(3주) 경과 & 수익률 +5% 미달 시 알림."""
+    if ticker in ALERT_EXCLUDE:
+        return []
+
+    try:
+        buy_date   = date.fromisoformat(buy_date_str)
+        today      = date.today()
+        held_days  = (today - buy_date).days
+    except ValueError:
+        return []
+
+    if held_days >= 21 and current_rate < 5.0:
+        return [
+            f"[{name} / {ticker}]  "
+            f"매수 후 {held_days}일 경과, 수익률 {fmt_rate(current_rate)} — "
+            f"시간 손절 기준 도달 (3주 이상 보유 & +5% 미달)"
+        ]
+    return []
+
+
+def check_profit_alert(ticker: str, name: str, current_rate: float) -> list[str]:
+    """익절 알림 조건 확인. 해당 항목 리스트 반환."""
+    if ticker in ALERT_EXCLUDE:
+        return []
+
+    alerts = []
+
+    # 조건 1: 수익률 +30% 이상 → 전량 익절
+    if current_rate >= 30.0:
+        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 전량 익절 목표 도달 (+30%)")
+    # 조건 2: 수익률 +20% 이상 → 절반 익절
+    elif current_rate >= 20.0:
+        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 절반 익절 목표 도달 (+20%)")
+
+    return alerts
 
 
 # ── 포맷 헬퍼 ─────────────────────────────────
@@ -122,7 +160,7 @@ def yellow(text: str) -> str:
 # ── 마크다운 저장 ──────────────────────────────
 
 def save_markdown(results: list, total_cost: float, total_value: float,
-                  krw_rate: float, alerts: list[str]):
+                  krw_rate: float, sell_alerts: list[str], profit_alerts: list[str]):
     now       = datetime.now()
     date_str  = now.strftime("%Y-%m-%d")
     time_str  = now.strftime("%H:%M")
@@ -142,14 +180,24 @@ def save_markdown(results: list, total_cost: float, total_value: float,
     lines.append(f"> 기준일시: {date_str} {time_str} | 적용 환율: 1 USD = {krw_rate:,.0f}원")
     lines.append("")
 
-    # 매도 알림 섹션
-    if alerts:
+    # 손절 알림 섹션
+    if sell_alerts:
         lines.append("---")
         lines.append("")
-        lines.append("## ⚠️ 매도 권장 알림")
+        lines.append("## 🚨 손절 권장 알림")
         lines.append("")
-        for alert in alerts:
-            lines.append(f"> 🚨 **{alert}**")
+        for alert in sell_alerts:
+            lines.append(f"> 🔴 **{alert}**")
+        lines.append("")
+
+    # 익절 알림 섹션
+    if profit_alerts:
+        lines.append("---")
+        lines.append("")
+        lines.append("## 💰 익절 권장 알림")
+        lines.append("")
+        for alert in profit_alerts:
+            lines.append(f"> 🟢 **{alert}**")
         lines.append("")
 
     lines.append("---")
@@ -208,10 +256,11 @@ def print_portfolio():
     )
     sep = "  " + "─" * (sum(col_w) + len(col_w) + 4)
 
-    total_cost  = 0.0
-    total_value = 0.0
-    results     = []
-    alerts      = []
+    total_cost    = 0.0
+    total_value   = 0.0
+    results       = []
+    sell_alerts   = []
+    profit_alerts = []
 
     # 각 종목 계산
     for stock in PORTFOLIO:
@@ -230,12 +279,12 @@ def print_portfolio():
         profit_krw = profit * krw_rate
         rate       = (price - avg) / avg * 100
 
-        history    = update_best_return(history, tick, rate)
+        history     = update_best_return(history, tick, rate)
         best_return = history[tick]["best_return"]
 
-        alert = check_alert(tick, name, rate, history)
-        if alert:
-            alerts.append(alert)
+        sell_alerts   += check_sell_alert(tick, name, rate, history)
+        sell_alerts   += check_time_stop_alert(tick, name, stock.get("buy_date", ""), rate)
+        profit_alerts += check_profit_alert(tick, name, rate)
 
         total_cost  += cost
         total_value += value
@@ -250,14 +299,24 @@ def print_portfolio():
     print("  ════════════════════════════════════════════════════════")
     print(f"  적용 환율: 1 USD = {krw_rate:,.0f}원")
 
-    # 매도 알림 (최상단 출력)
-    if alerts:
+    # 손절 알림 (최상단 출력)
+    if sell_alerts:
         print()
         print("  ┌─────────────────────────────────────────────────────┐")
-        print("  │              ⚠️  매도 권장 알림                      │")
+        print("  │                🚨  손절 권장 알림                    │")
         print("  ├─────────────────────────────────────────────────────┤")
-        for alert in alerts:
-            print(f"  │  🚨 {yellow(alert):<60}│")
+        for alert in sell_alerts:
+            print(f"  │  🔴 {yellow(alert):<60}│")
+        print("  └─────────────────────────────────────────────────────┘")
+
+    # 익절 알림 (손절 알림 바로 아래)
+    if profit_alerts:
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │                💰  익절 권장 알림                    │")
+        print("  ├─────────────────────────────────────────────────────┤")
+        for alert in profit_alerts:
+            print(f"  │  🟢 {alert:<60}│")
         print("  └─────────────────────────────────────────────────────┘")
 
     print()
@@ -305,7 +364,7 @@ def print_portfolio():
     print(f"  │  총 수익률   : {color(fmt_rate(total_rate), total_rate):<47}│")
     print("  └─────────────────────────────────────────────────────┘")
 
-    save_markdown(results, total_cost, total_value, krw_rate, alerts)
+    save_markdown(results, total_cost, total_value, krw_rate, sell_alerts, profit_alerts)
     print()
 
 
