@@ -14,5 +14,21 @@
   "MRK": {
     "best_return": 6.88,
     "best_date": "2026-05-25"
+  },
+  "RKLB": {
+    "best_return": 12.57,
+    "best_date": "2026-05-27"
+  },
+  "ANET": {
+    "best_return": 6.25,
+    "best_date": "2026-05-27"
+  },
+  "VRT": {
+    "best_return": -2.93,
+    "best_date": "2026-05-27"
+  },
+  "NET": {
+    "best_return": -1.44,
+    "best_date": "2026-05-27"
   }
 }
