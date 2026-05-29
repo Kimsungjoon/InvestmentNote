@@ -12,10 +12,10 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 # buy_date: 실제 매수일로 수정해주세요 (YYYY-MM-DD)
 # ─────────────────────────────────────────────
 PORTFOLIO = [
-    {"name": "로켓랩",           "ticker": "RKLB", "avg_price": 133.4578, "qty": 23, "buy_date": "2026-05-27"},
     {"name": "아리스타 네트웍스", "ticker": "ANET", "avg_price": 145.2359, "qty": 34, "buy_date": "2026-05-27"},
-    {"name": "버티브 홀딩스",     "ticker": "VRT",  "avg_price": 329.4436, "qty": 14, "buy_date": "2026-05-27"},
-    {"name": "클라우드플레어",    "ticker": "NET",  "avg_price": 212.2794, "qty": 16, "buy_date": "2026-05-27"},
+    {"name": "네비우스",         "ticker": "NBIS", "avg_price": 222.2593, "qty": 15, "buy_date": "2026-05-30"},
+    {"name": "AMD",             "ticker": "AMD",  "avg_price": 506.9238, "qty": 8,  "buy_date": "2026-05-30"},
+    {"name": "어플라이드 머티어리얼즈", "ticker": "AMAT", "avg_price": 451.0000, "qty": 8,  "buy_date": "2026-05-30"},
 ]
 
 # 매도 알림에서 제외할 티커
