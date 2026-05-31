@@ -258,6 +258,10 @@ def analyze(ticker: str, name: str, marketcap: float | None = None,
     checks["주가>5일선"] = ma5 is not None and price > ma5
     checks["5일선 우상향"] = ma5_prev is not None and ma5 > ma5_prev
     checks["5일선>20일선(골든)"] = ma5 is not None and ma20 is not None and ma5 > ma20
+    checks["완전정배열(5>20>50)"] = (
+        ma5 is not None and ma20 is not None and ma50 is not None
+        and ma5 > ma20 > ma50
+    )
     # 모멘텀
     checks[f"RSI {RSI_MIN}~{RSI_MAX}"] = r is not None and RSI_MIN <= r <= RSI_MAX
     rsi_key = f"RSI {RSI_MIN}~{RSI_MAX}"
@@ -274,8 +278,8 @@ def analyze(ticker: str, name: str, marketcap: float | None = None,
     trend_ok = checks["주가>50일선>200일선"] and checks["50일선 우상향"]
     # 2) RSI 건전: 40~65 (과매수 추격 차단)
     rsi_ok = checks[rsi_key]
-    # 3) 단기 정배열: 5일선>20일선
-    short_ok = checks["5일선>20일선(골든)"]
+    # 3) 단기 정배열: 5일선>20일선, 그리고 완전 정배열(5>20>50) 유지
+    short_ok = checks["5일선>20일선(골든)"] and checks["완전정배열(5>20>50)"]
     # 4) 진입 여력: 신고점 과열 아님 (RSI 상한 이내)
     not_overbought = r is not None and r <= RSI_MAX
     ext_5ma = ((price - ma5) / ma5 * 100) if ma5 else 0  # 5일선 이격도
@@ -368,7 +372,7 @@ def main():
     print("=" * 78)
     for a in graded:
         cap_str = f"${a['marketcap']:,.0f}B" if a['marketcap'] else "N/A"
-        print(f"\n  {a['name']} ({a['ticker']})   점수 {a['score']}/9 | "
+        print(f"\n  {a['name']} ({a['ticker']})   점수 {a['score']}/{len(a['checks'])} | "
               f"눌림목품질 {a['pullback_quality']:.0f} | 시총 {cap_str}")
         print(f"    현재가 ${fmt(a['price'])} | RSI {fmt(a['rsi'],nd=1)} | "
               f"고점대비 {fmt(a['from_high'],'%',1)} | "
@@ -402,6 +406,8 @@ def main():
             tag = "RSI"
         elif not a["checks"]["주가>5일선"]:
             tag = "5MA아래"
+        elif not a["checks"]["완전정배열(5>20>50)"]:
+            tag = "정배열X"
         elif REQUIRE_VOLUME and not a["checks"]["거래량>20일평균"]:
             tag = "거래량↓"
         elif REQUIRE_FUNDAMENTAL and not a["fundamental_pass"]:
@@ -411,7 +417,7 @@ def main():
             tag = "추세"
         print(f"  {a['name']:<16}{a['ticker']:<7}"
               f"{fmt(a['price']):>10}{cap_str:>9}{fmt(a['rsi'],nd=0):>5}"
-              f"{fmt(a['from_high'],'%',1):>10}{a['score']:>4}/9{tag:>12}")
+              f"{fmt(a['from_high'],'%',1):>10}{a['score']:>3}/{len(a['checks'])}{tag:>12}")
     print()
 
 
