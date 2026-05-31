@@ -167,7 +167,7 @@ def save_markdown(results: list, total_cost: float, total_value: float,
     month_dir = f"{now.month}월"
     filename  = f"포트폴리오_{date_str}.md"
 
-    month_path = BASE_DIR / "매매노트" / month_dir
+    month_path = BASE_DIR / "매매리포트" / month_dir
     month_path.mkdir(parents=True, exist_ok=True)
     save_path = month_path / filename
 
@@ -238,7 +238,7 @@ def save_markdown(results: list, total_cost: float, total_value: float,
     lines.append("")
 
     save_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"\n  💾 저장 완료: 매매노트/{month_dir}/{filename}")
+    print(f"\n  💾 저장 완료: 매매리포트/{month_dir}/{filename}")
 
 
 # ── 메인 출력 ──────────────────────────────────
