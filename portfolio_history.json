@@ -1,18 +1,18 @@
 {
   "ANET": {
-    "best_return": 9.8,
-    "best_date": "2026-05-29"
+    "best_return": 17.52,
+    "best_date": "2026-06-01"
   },
   "NBIS": {
-    "best_return": 3.97,
-    "best_date": "2026-05-29"
+    "best_return": 19.01,
+    "best_date": "2026-06-01"
   },
   "AMD": {
     "best_return": 1.81,
     "best_date": "2026-05-29"
   },
   "AMAT": {
-    "best_return": 0.0,
-    "best_date": "2026-05-30"
+    "best_return": 1.59,
+    "best_date": "2026-06-01"
   }
 }
