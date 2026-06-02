@@ -13,9 +13,9 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 # ─────────────────────────────────────────────
 PORTFOLIO = [
     {"name": "아리스타 네트웍스", "ticker": "ANET", "avg_price": 145.2359, "qty": 20, "buy_date": "2026-05-27"},
-    {"name": "네비우스",         "ticker": "NBIS", "avg_price": 222.2593, "qty": 7,  "buy_date": "2026-05-30"},
     {"name": "AMD",             "ticker": "AMD",  "avg_price": 506.9238, "qty": 8,  "buy_date": "2026-05-30"},
     {"name": "어플라이드 머티어리얼즈", "ticker": "AMAT", "avg_price": 451.0000, "qty": 8,  "buy_date": "2026-05-30"},
+    {"name": "NXP 반도체",       "ticker": "NXPI", "avg_price": 324.0781, "qty": 11, "buy_date": "2026-06-03"},
 ]
 
 # 매도 알림에서 제외할 티커
