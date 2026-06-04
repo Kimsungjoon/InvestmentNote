@@ -4,8 +4,8 @@
     "best_date": "2026-06-03"
   },
   "AMAT": {
-    "best_return": 11.04,
-    "best_date": "2026-06-03"
+    "best_return": 11.24,
+    "best_date": "2026-06-04"
   },
   "NXPI": {
     "best_return": 0.0,
@@ -16,7 +16,7 @@
     "best_date": "2026-06-04"
   },
   "ETN": {
-    "best_return": 0.0,
+    "best_return": 1.9,
     "best_date": "2026-06-04"
   }
 }
