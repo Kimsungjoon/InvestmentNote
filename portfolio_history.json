@@ -1,8 +1,4 @@
 {
-  "ANET": {
-    "best_return": 20.72,
-    "best_date": "2026-06-02"
-  },
   "AMD": {
     "best_return": 7.02,
     "best_date": "2026-06-03"
@@ -14,5 +10,13 @@
   "NXPI": {
     "best_return": 0.0,
     "best_date": "2026-06-03"
+  },
+  "ABNB": {
+    "best_return": 0.0,
+    "best_date": "2026-06-04"
+  },
+  "ETN": {
+    "best_return": 0.0,
+    "best_date": "2026-06-04"
   }
 }
