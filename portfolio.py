@@ -12,9 +12,6 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 # buy_date: 실제 매수일로 수정해주세요 (YYYY-MM-DD)
 # ─────────────────────────────────────────────
 PORTFOLIO = [
-    {"name": "AMD",             "ticker": "AMD",  "avg_price": 506.9238, "qty": 8,  "buy_date": "2026-05-30"},
-    {"name": "어플라이드 머티어리얼즈", "ticker": "AMAT", "avg_price": 451.0000, "qty": 8,  "buy_date": "2026-05-30"},
-    {"name": "NXP 반도체",       "ticker": "NXPI", "avg_price": 324.0781, "qty": 11, "buy_date": "2026-06-03"},
     {"name": "에어비앤비",        "ticker": "ABNB", "avg_price": 135.9400, "qty": 15, "buy_date": "2026-06-04"},
     {"name": "이튼",             "ticker": "ETN",  "avg_price": 410.8076, "qty": 8,  "buy_date": "2026-06-04"},
 ]
