@@ -3,8 +3,12 @@
     "best_return": 0.0,
     "best_date": "2026-06-04"
   },
-  "ETN": {
-    "best_return": 1.9,
-    "best_date": "2026-06-04"
+  "FTNT": {
+    "best_return": 0.0,
+    "best_date": "2026-06-13"
+  },
+  "DELL": {
+    "best_return": 0.0,
+    "best_date": "2026-06-13"
   }
 }
