@@ -10,5 +10,9 @@
   "DELL": {
     "best_return": 0.0,
     "best_date": "2026-06-13"
+  },
+  "ANET": {
+    "best_return": 0.0,
+    "best_date": "2026-06-13"
   }
 }
