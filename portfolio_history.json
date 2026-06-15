@@ -1,15 +1,15 @@
 {
   "FTNT": {
-    "best_return": 0.61,
-    "best_date": "2026-06-12"
+    "best_return": 2.8,
+    "best_date": "2026-06-15"
   },
   "DELL": {
-    "best_return": 0.0,
-    "best_date": "2026-06-13"
+    "best_return": 1.7,
+    "best_date": "2026-06-15"
   },
   "ANET": {
-    "best_return": 0.0,
-    "best_date": "2026-06-13"
+    "best_return": 2.54,
+    "best_date": "2026-06-15"
   },
   "CDNS": {
     "best_return": 0.0,
