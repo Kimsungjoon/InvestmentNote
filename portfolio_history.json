@@ -11,6 +11,10 @@
     "best_return": 2.89,
     "best_date": "2026-06-18"
   },
+  "AMD": {
+    "best_return": 0.0,
+    "best_date": "2026-06-22"
+  },
   "CDNS": {
     "best_return": 0.0,
     "best_date": "2026-06-14"
