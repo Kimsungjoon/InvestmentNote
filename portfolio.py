@@ -12,11 +12,10 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 # buy_date: 실제 매수일로 수정해주세요 (YYYY-MM-DD)
 # ─────────────────────────────────────────────
 PORTFOLIO = [
-    {"name": "포티넷",           "ticker": "FTNT", "avg_price": 145.0796, "qty": 23, "buy_date": "2026-06-13"},
-    {"name": "델 테크놀로지스",    "ticker": "DELL", "avg_price": 410.5125, "qty": 8,  "buy_date": "2026-06-13"},
-    {"name": "아리스타 네트웍스", "ticker": "ANET", "avg_price": 166.5240, "qty": 20, "buy_date": "2026-06-13"},
-    {"name": "AMD",              "ticker": "AMD",  "avg_price": 533.9200, "qty": 6,  "buy_date": "2026-06-22"},
-    {"name": "케이던스",          "ticker": "CDNS", "avg_price": 395.3400, "qty": 10, "buy_date": "2026-06-14"},
+    {"name": "크레도 테크놀로지",    "ticker": "CRDO", "avg_price": 256.5088, "qty": 17, "buy_date": "2026-07-07"},
+    {"name": "케이던스",          "ticker": "CDNS", "avg_price": 396.3280, "qty": 10, "buy_date": "2026-06-14"},
+    {"name": "하우멧 에어로스페이스", "ticker": "HWM",  "avg_price": 279.5975, "qty": 12, "buy_date": "2026-07-07"},
+    {"name": "마이크론",          "ticker": "MU",   "avg_price": 1047.2967, "qty": 3,  "buy_date": "2026-07-01"},
 ]
 
 # 매도 알림에서 제외할 티커
@@ -221,7 +220,7 @@ def save_markdown(results: list, total_cost: float, total_value: float,
         )
 
     tp_str  = f"+${total_profit:,.2f}"          if total_profit >= 0 else f"-${abs(total_profit):,.2f}"
-    tpk_str = f"+₩{total_profit*krw_rate:,.0f}" if total_profit >= 0 else f"-₩{abs(total_profit*krw_rate):,.0f}"
+    tpk_str = f"+₩{total_profit*krw_rate:,.0f}" if total_profit >= 0 else f"-₩{total_profit*krw_rate:,.0f}"
     tr_str  = fmt_rate(total_rate)
     lines.append(f"| **합계** | | | | **{tp_str}** | **{tpk_str}** | **{tr_str}** | | |")
 
