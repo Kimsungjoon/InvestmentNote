@@ -1,212 +1,288 @@
 """
-스윙 매매 종목 스크리너 (듀얼 모드)
-─────────────────────
-투자기업가치기준.md 의 2단계(기술적 진입 기준)를 실제 일봉 데이터로 객관 검증한다.
-
-★ 눌림목 모드: 5MA 근처 눌림 + RSI 40~70 + 이격 ≤3.5% + 거래량(전일≥20일평균×0.6, 장중 보정)
-☆ 모멘텀 모드: 5MA 가속(+4~10%) + 5-20MA 이격≤10% + RSI 55~80 + 신고가 근처 + 거래량 + RS>QQQ
+나스닥 / 코스피 매수 후보발굴 스크리너
+────────────────────────────────────────────────────────────────────────
+나스닥: QQQ 상대강도 · 20/50/200일선 추세 · 눌림목 / 돌파 / 에너지응축
+코스피: 안전마진(PBR·PER) · 실적모멘텀(매출성장·목표가괴리율)
+        · 수급전환(네이버 기관·외국인 순매수) · 재무안정성(ROE·부채비율)
+────────────────────────────────────────────────────────────────────────
+사용법:
+  python3 screener.py            나스닥 스캔 (기본)
+  python3 screener.py --kospi    코스피 스캔
 """
 
+import argparse
+import concurrent.futures as cf
+import re
 import requests
+from bs4 import BeautifulSoup
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+INCOMPLETE_VOL_RATIO = 0.50  # 당일 거래량이 20일 평균의 50% 미만이면 장중 미완성 봉으로 판단
 
-# ── 필터 기준 (원하면 숫자만 조정) ──
-MIN_MARKETCAP_B = 10     # 시총 하한 (단위: 10억 달러). 중소형 포함, 마이크로캡만 제외
-MAX_MARKETCAP_B = 1000   # 시총 상한 (단위: 10억 달러). 초과 시 "초대형(무거움)"으로 제외
-# 시총 상한·단가 상한 예외: $1T·$600 초과여도 사이클·고베타로 스윙에 적합한 대형주
-CAP_EXEMPT = {"MU"}      # 마이크론 — 메모리 슈퍼사이클, 고가·대형이지만 변동성 유지
-MAX_PRICE       = 600    # 주당 단가 상한 ($). 초과 시 제외
-RSI_MIN         = 40     # RSI 하한
-RSI_MAX         = 70     # RSI 상한
+# ══════════════════════════════════════════════════════════════════════
+#  나스닥 설정
+# ══════════════════════════════════════════════════════════════════════
+NASDAQ_INDEX  = "QQQ"
+ND_MIN_CAP_B  = 10      # 시총 하한 ($B) — 마이크로캡 제외
+ND_MAX_PRICE  = 800     # 단가 상한 ($)
+ND_MAX_DEBT   = 200     # 부채비율 상한 (%)
 
-# ── 손실 방지 보강 필터 (눌림목 모드) ──
-MAX_EXT_5MA     = 3.5    # 5일선 이격 상한(%) — 추격 진입 완화 (4→3.5)
-REQUIRE_MARKET_REGIME = True  # 시장 레짐 필터: 지수(QQQ)가 약세면 전 종목 진입 보류
-MARKET_INDEX    = "QQQ"  # 시장 레짐 판단 기준 지수
+# ── 눌림목: 상승추세 + 5/20MA 근처 조정 + 거래량 수축 ──
+PB_5MA_RANGE  = 2.5     # 5MA 이격 ±2.5% 이내
+PB_FROM_20MA  = 4.0     # 20MA 아래 최대 -4%까지 허용
+PB_RSI_MIN    = 38
+PB_RSI_MAX    = 65
+PB_VOL_MAX    = 1.05    # 5d/20d vol ≤ 1.05 (거래량 수축)
 
-# ── 모멘텀 모드 (듀얼 출력) ──
-MIN_EXT_5MA_MOM = 4.0    # 주가 vs 5일선 이격 하한 — 5MA 위 가속 구간
-MAX_EXT_5MA_MOM = 10.0   # 주가 vs 5일선 이격 상한 (15→10 타이트)
-MAX_MA5_20_SPREAD = 12.0 # 5일선 vs 20일선 이격 상한(%) — 단기·중기 과도 벌어짐 차단
-MOM_RSI_MIN     = 55     # 모멘텀 RSI 하한 (강세 확인)
-MOM_RSI_MAX     = 75     # 모멘텀 RSI 상한 (80→75 타이트)
-MOM_FROM_HIGH   = -5.0   # 52주 고점 대비 % (-8→-5, 신고가에 더 가까워야 함)
-MOM_VOLUME_MULT = 0.8    # 5일 평균 거래량 ≥ 20일 평균의 80% (0.9→0.8)
-MOM_REQUIRE_RS  = True   # 20일 수익률 > QQQ (상대강도)
+# ── 돌파: 52주 고점 근접 + 거래량 급증 ──
+BK_FROM_HIGH  = -6.0    # 52주 고점 대비 -6% 이내
+BK_RSI_MIN    = 58
+BK_RSI_MAX    = 82
+BK_VOL_MIN    = 1.1     # 5d/20d vol ≥ 1.1 (거래량 동반)
 
-# 눌림목 모드: 거래량 ≥ 20일 평균 × VOLUME_MULT (매수세 최소 확인)
-REQUIRE_VOLUME  = True   # 거래량 조건 활성화
-VOLUME_MULT     = 0.6    # 거래량 기준 배수 (장중 보정 후 0.6 — 이전 0.5는 미완성 당일 봉 오류 때문)
-# 장중 미완성 당일 봉: 당일 거래량 < 20일평균×이 비율이면 전일 거래량으로 대체
-INCOMPLETE_VOL_RATIO = 0.50
+# ── 에너지응축: 5/20/50MA 간격 좁은 삼각수렴 구간 ──
+SQ_5_20_MAX   = 5.0     # |5MA - 20MA| / 20MA (%)
+SQ_20_50_MAX  = 8.0     # |20MA - 50MA| / 50MA (%)
+SQ_RANGE_MAX  = 14.0    # 20일 가격 레인지 / 현재가 (%)
+SQ_RSI_MIN    = 43
+SQ_RSI_MAX    = 70
 
-# 1단계 펀더멘털 필터 (투자기업가치기준.md — 비반도체 성장주 포용으로 완화)
-REQUIRE_FUNDAMENTAL = True
-MIN_ROE         = 0.10   # 수익성 경로: ROE 10% 이상
-MAX_DEBT_EQUITY = 200    # 부채비율(D/E, %) 200% 이하 (필수)
-HIGH_GROWTH     = 0.30   # 초고성장 경로: 매출성장 30%↑이면 적자여도 허용
+# ══════════════════════════════════════════════════════════════════════
+#  코스피 설정
+# ══════════════════════════════════════════════════════════════════════
+KOSPI_INDEX   = "^KS11"
 
-# 후보 종목군 (반도체·AI인프라·우주항공·소프트웨어/SaaS·핀테크·인터넷·산업/방산 등 멀티섹터)
-CANDIDATES = {
-    "TSLA": "테슬라",
-    "INTC": "인텔",
-    "GEV":  "GE 버노바",
-    "MRVL": "마벨 테크놀로지",
-    "CRWD": "크라우드스트라이크",
-    "PLTR": "팔란티어",
-    "ORCL": "오라클",
-    "AMD":  "AMD",
-    "MU":   "마이크론",
-    "ANET": "아리스타 네트웍스",
-    "VRT":  "버티브 홀딩스",
-    "NET":  "클라우드플레어",
-    "RKLB": "로켓랩",
-    "SMCI": "슈퍼마이크로",
-    "DELL": "델 테크놀로지스",
-    "NOW":  "서비스나우",
-    "PANW": "팔로알토 네트웍스",
-    "ASML": "ASML",
-    "LRCX": "램리서치",
-    "COIN": "코인베이스",
-    # 확장 후보
-    "AVGO": "브로드컴",
-    "KLAC": "KLA",
-    "AMAT": "어플라이드 머티어리얼즈",
-    "TER":  "테라다인",
-    "ARM":  "ARM 홀딩스",
-    "SNPS": "시놉시스",
-    "CDNS": "케이던스",
-    "DDOG": "데이터독",
-    "SNOW": "스노우플레이크",
-    "ZS":   "지스케일러",
-    "NXPI": "NXP 반도체",
-    "ON":   "온세미",
-    "MPWR": "모놀리식 파워",
-    "ENPH": "엔페이즈",
-    "FSLR": "퍼스트솔라",
-    "CEG":  "콘스텔레이션 에너지",
-    "VST":  "비스트라",
-    "LMT":  "록히드마틴",
-    "AXON": "액손 엔터프라이즈",
-    "ASTS": "AST 스페이스모바일",
-    # 중소형 미래산업 확장 (AI 연결/광/전력반도체/우주/원전/AI인프라)
-    "ALAB": "아스테라 랩스",
-    "CRDO": "크레도 테크놀로지",
-    "LSCC": "래티스 반도체",
-    "RMBS": "램버스",
-    "AMBA": "암바렐라",
-    "COHR": "코히어런트",
-    "LITE": "루멘텀",
-    "FN":   "파브리넷",
+KS_PBR_MAX    = 1.5     # PBR 상한 (안전마진 기준)
+KS_PBR_GOOD   = 1.0     # PBR 우수 기준 (2점)
+KS_PER_MAX    = 22      # PER 상한
+KS_PER_GOOD   = 12      # PER 우수 기준 (2점)
+KS_ROE_MIN    = 0.07    # ROE 하한 (7%)
+KS_DEBT_MAX   = 200     # 부채비율 상한 (%)
+KS_RSI_MIN    = 38
+KS_RSI_MAX    = 70
+KS_FLOW_DAYS  = 5       # 수급 가점: 기관+외국인 N일 누적 순매수 > 0
+KS_TGT_GAP    = 0.15    # 목표주가 괴리율 하한 (15%)
+
+# ══════════════════════════════════════════════════════════════════════
+#  나스닥 종목 리스트 (~220개, 나스닥100 + 성장/모멘텀 확장 유니버스)
+# ══════════════════════════════════════════════════════════════════════
+NASDAQ_CANDIDATES = {
+    # ── 반도체 / GPU / 장비 ──
+    "NVDA": "엔비디아",         "AMD":  "AMD",
+    "AVGO": "브로드컴",         "MU":   "마이크론",
+    "MRVL": "마벨 테크놀로지",   "AMAT": "어플라이드 머티어리얼즈",
+    "LRCX": "램리서치",         "KLAC": "KLA",
+    "ASML": "ASML",            "ARM":  "ARM 홀딩스",
+    "QCOM": "퀄컴",             "TXN":  "텍사스 인스트루먼트",
+    "ADI":  "아날로그 디바이스", "TSM":  "TSMC",
+    "SNPS": "시놉시스",         "CDNS": "케이던스",
+    "INTC": "인텔",             "WDC":  "웨스턴 디지털",
+    "ON":   "온세미",           "NXPI": "NXP 반도체",
+    "MPWR": "모놀리식 파워",     "ALAB": "아스테라 랩스",
+    "CRDO": "크레도 테크놀로지", "COHR": "코히어런트",
+    "LITE": "루멘텀",           "LSCC": "래티스 반도체",
+    "ONTO": "온토 이노베이션",   "ENTG": "엔테그리스",
+    "MKSI": "MKS",             "SITM": "사이타임",
     "CLS":  "셀레스티카",
-    "KTOS": "크라토스 디펜스",
-    "LUNR": "인튜이티브 머신스",
-    "RGTI": "리게티 컴퓨팅",
-    "IONQ": "아이온큐",
-    "OKLO": "오클로",
-    "SMR":  "뉴스케일 파워",
-    "NBIS": "네비우스",
-    "IREN": "아이렌",
-    "S":    "센티넬원",
-    "GTLB": "깃랩",
-    "MDB":  "몽고DB",
-    "PSTG": "퓨어 스토리지",
-    "ALTR": "알테어",
-    "INDI": "인디 세미컨덕터",
-    "POWI": "파워 인티그레이션스",
-    "SITM": "사이타임",
-    # ── 소프트웨어 / SaaS / 클라우드 확장 ──
-    "CRM":  "세일즈포스",
-    "ADBE": "어도비",
-    "INTU": "인튜이트",
-    "WDAY": "워크데이",
-    "TEAM": "아틀라시안",
-    "HUBS": "허브스팟",
-    "SHOP": "쇼피파이",
-    "VEEV": "비바 시스템스",
-    "APP":  "앱러빈",
-    "TWLO": "트윌리오",
-    "OKTA": "옥타",
-    "FTNT": "포티넷",
-    "ESTC": "일래스틱",
-    "CFLT": "컨플루언트",
-    "PATH": "유아이패스",
-    "U":    "유니티 소프트웨어",
-    "RBLX": "로블록스",
-    "DOCN": "디지털오션",
-    "NTNX": "뉴타닉스",
-    "FROG": "제이프로그",
+    "SWKS": "스카이웍스",       "QRVO": "코르보",
+    "MTSI": "MACOM",           "CRUS": "시러스 로직",
+    "DIOD": "다이오즈",         "VSH":  "비쉐이 인터테크놀로지",
+    "AEIS": "어드밴스드 에너지","UCTT": "울트라 클린 홀딩스",
+    "ICHR": "아이커 시스템즈",   "AMKR": "앰코 테크놀로지",
+    "NVMI": "노바 엘티디",      "CEVA": "세바",
+    "SLAB": "실리콘 랩스",      "MXL":  "맥스리니어",
+    "AOSL": "알파앤오메가 세미컨덕터","SYNA": "시냅틱스",
+    "WOLF": "울프스피드",
+    # ── AI 인프라 / 서버 / 네트워킹 ──
+    "ANET": "아리스타 네트웍스", "DELL": "델 테크놀로지스",
+    "HPE":  "HPE",             "VRT":  "버티브 홀딩스",
+    "SMCI": "슈퍼마이크로",     "CSCO": "시스코",
+    "FFIV": "F5",              "AKAM": "아카마이",
+    "CIEN": "시에나",          "NBIS": "네비우스",
+    "JNPR": "쥬니퍼 네트웍스",
+    # ── 빅테크 / 클라우드 ──
+    "MSFT": "마이크로소프트",   "GOOGL":"알파벳",
+    "META": "메타 플랫폼스",   "AMZN": "아마존",
+    "NFLX": "넷플릭스",        "IBM":  "IBM",
+    # ── 사이버보안 ──
+    "CRWD": "크라우드스트라이크","PANW": "팔로알토",
+    "FTNT": "포티넷",          "NET":  "클라우드플레어",
+    "ZS":   "지스케일러",      "OKTA": "옥타",
+    "S":    "센티넬원",        "CHKP": "체크포인트",
+    "TENB": "테너블",          "RPD":  "래피드7",
+    "VRNS": "베라토",          "QLYS": "퀄리스",
+    # ── SaaS / 소프트웨어 ──
+    "NOW":  "서비스나우",       "CRM":  "세일즈포스",
+    "ADBE": "어도비",          "INTU": "인튜이트",
+    "WDAY": "워크데이",        "ORCL": "오라클",
+    "TEAM": "아틀라시안",      "HUBS": "허브스팟",
+    "MDB":  "몽고DB",          "SNOW": "스노우플레이크",
+    "DDOG": "데이터독",        "PLTR": "팔란티어",
+    "APP":  "앱러빈",          "SHOP": "쇼피파이",
+    "TWLO": "트윌리오",        "IOT":  "Samsara",
+    "DT":   "Dynatrace",      "NTNX": "뉴타닉스",
+    "VEEV": "비바 시스템스",    "GTLB": "깃랩",
+    "ZM":   "줌 커뮤니케이션즈","DOCU": "도큐사인",
+    "ESTC": "일래스틱",        "ASAN": "아사나",
+    "SMAR": "스마트시트",      "BOX":  "박스",
+    "DBX":  "드롭박스",        "PD":   "페이저듀티",
+    "BRZE": "브레이즈",        "YEXT": "옉스트",
+    "CFLT": "컨플루언트",      "ALTR": "알테어",
+    "PATH": "유아이패스",      "FROG": "제이프로그",
+    "PCTY": "페이로시티",      "PCOR": "프로코어",
+    "BILL": "빌닷컴",          "U":    "유니티 소프트웨어",
+    "RBLX": "로블록스",        "DOCN": "디지털오션",
     # ── 핀테크 / 결제 ──
-    "XYZ":  "블록",
-    "PYPL": "페이팔",
-    "SOFI": "소파이",
-    "AFRM": "어펌",
-    "HOOD": "로빈후드",
-    "TOST": "토스트",
-    "NU":   "누 홀딩스",
-    "BILL": "빌닷컴",
-    # ── 인터넷 / 플랫폼 / 소비 ──
-    "UBER": "우버",
-    "ABNB": "에어비앤비",
-    "DASH": "도어대시",
-    "SPOT": "스포티파이",
-    "RDDT": "레딧",
-    "PINS": "핀터레스트",
-    # ── 산업 / 방산 / 전력 인프라 ──
-    "ETN":  "이튼",
-    "PWR":  "콴타 서비시스",
-    "NVT":  "엔베트",
-    "PH":   "파커 하니핀",
-    "HWM":  "하우멧 에어로스페이스",
-    # ── 반도체 확장 (GPU·파운드리·메모리·아날로그) ──
-    "NVDA": "엔비디아",
-    "QCOM": "퀄컴",
-    "TXN":  "텍사스 인스트루먼트",
-    "ADI":  "아날로그 디바이스",
-    "MCHP": "마이크로칩 테크놀로지",
-    "TSM":  "TSMC",
-    "WDC":  "웨스턴 디지털",
-    "STX":  "시게이트 테크놀로지",
-    "ENTG": "엔테그리스",
-    "MKSI": "MKS",
-    "ONTO": "온토 이노베이션",
-    "ACLS": "악셀리스",
-    # ── 빅테크 / 클라우드 / 플랫폼 ──
-    "MSFT": "마이크로소프트",
-    "GOOGL": "알파벳",
-    "META": "메타 플랫폼스",
-    "AMZN": "아마존",
-    "NFLX": "넷플릭스",
-    "CSCO": "시스코",
-    "IBM":  "IBM",
-    "HPE":  "HPE",
-    "MNDY": "먼데이닷컴",
-    "ROKU": "로쿠",
-    # ── 네트워크 / 인프라 SW ──
-    "AKAM": "아카마이",
-    "FFIV": "F5",
-    "CIEN": "시에나",
-    # ── 사이버보안 확장 ──
-    "CHKP": "체크포인트",
-    "GEN":  "젠 디지털",
-    "TENB": "테너블",
-    "CYBR": "사이버아크",
-    # ── 게임 / 디지털 콘텐츠 ──
-    "EA":   "EA",
-    "TTWO": "타케투 인터랙티브",
-    # ── AI·데이터·엔터프라이즈 SW ──
-    "AI":   "C3.ai",
-    "BBAI": "빅베어.ai",
-    "IOT":  "Samsara",
-    "DT":   "Dynatrace",
-    "PCTY": "Paylocity",
-    "PCOR": "Procore",
+    "XYZ":  "블록",            "PYPL": "페이팔",
+    "COIN": "코인베이스",      "SOFI": "소파이",
+    "AFRM": "어펌",            "HOOD": "로빈후드",
+    "NU":   "누 홀딩스",       "TOST": "토스트",
+    "GPN":  "글로벌 페이먼츠", "FIS":  "FIS",
+    "PAYX": "페이첵스",        "ADP":  "오토매틱 데이터 프로세싱",
+    # ── 인터넷 / 플랫폼 ──
+    "UBER": "우버",            "ABNB": "에어비앤비",
+    "DASH": "도어대시",        "SPOT": "스포티파이",
+    "RDDT": "레딧",            "PINS": "핀터레스트",
+    "MTCH": "매치그룹",        "EXPE": "익스피디아",
+    "MELI": "메르카도리브레",   "EBAY": "이베이",
+    "ETSY": "엣시",            "W":    "웨이페어",
+    # ── 중국 ADR (나스닥 상장) ──
+    "PDD":  "핀둬둬",          "JD":   "JD닷컴",
+    "BIDU": "바이두",          "NTES": "넷이즈",
+    "TCOM": "트립닷컴",        "BILI": "빌리빌리",
+    # ── 소비 / 리테일 (나스닥) ──
+    "COST": "코스트코",        "SBUX": "스타벅스",
+    "BKNG": "부킹홀딩스",      "LULU": "룰루레몬",
+    "ROST": "로스 스토어스",   "ORLY": "오라일리 오토모티브",
+    "CHWY": "츄이",            "WING": "윙스탑",
+    "CAVA": "카바 그룹",       "DKNG": "드래프트킹스",
+    "ULTA": "울타뷰티",
+    # ── 통신 / 케이블 ──
+    "TMUS": "T모바일",         "CMCSA":"컴캐스트",
+    "CHTR": "차터 커뮤니케이션즈",
+    # ── 바이오 / 제약 (나스닥 대형) ──
+    "GILD": "길리어드 사이언스","VRTX": "버텍스 파마슈티컬",
+    "REGN": "리제네론",        "AMGN": "암젠",
+    "BIIB": "바이오젠",        "MRNA": "모더나",
+    "ILMN": "일루미나",        "ALNY": "알나일람",
+    "BMRN": "바이오마린",      "INCY": "인사이트",
+    "EXAS": "이그젝트 사이언스","NBIX": "뉴로크린 바이오사이언스",
+    "IONS": "아이오닉스 파마슈티컬",
+    # ── 전력 / 에너지 / 산업 ──
+    "VST":  "비스트라",        "CEG":  "콘스텔레이션 에너지",
+    "GEV":  "GE 버노바",       "ETN":  "이튼",
+    "PWR":  "콴타 서비시스",   "HWM":  "하우멧 에어로스페이스",
+    "PH":   "파커 하니핀",     "NVT":  "엔베트",
+    "CSX":  "CSX",             "PCAR": "팩카",
+    "ODFL": "올드 도미니언",   "FAST": "패스널",
+    "PAYC": "페이콤",          "JBHT": "제이비 헌트",
+    # ── 방산 / 우주 ──
+    "LMT":  "록히드마틴",      "AXON": "액손 엔터프라이즈",
+    "KTOS": "크라토스 디펜스", "RKLB": "로켓랩",
+    # ── EV / 재생에너지 ──
+    "TSLA": "테슬라",          "RIVN": "리비안",
+    "LCID": "루시드 모터스",   "SEDG": "솔라엣지",
+    "RUN":  "선런",            "CHPT": "차지포인트",
+    "BE":   "블룸 에너지",
+    # ── AI 특화 소형 ──
+    "ASTS": "AST 스페이스모바일","IONQ": "아이온큐",
+    "BBAI": "빅베어.ai",       "SOUN": "사운드하운드 AI",
+    "UPST": "업스타트",        "AI":   "C3.ai",
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  코스피 종목 리스트 (~120개, 코스피 시총 상위 + 섹터 대표주 확장)
+# ══════════════════════════════════════════════════════════════════════
+KOSPI_CANDIDATES = {
+    # ── 반도체 / IT부품 ──
+    "005930.KS": "삼성전자",       "000660.KS": "SK하이닉스",
+    "011070.KS": "LG이노텍",       "402340.KS": "SK스퀘어",
+    "009150.KS": "삼성전기",       "000990.KS": "DB하이텍",
+    # ── 2차전지 / 화학 ──
+    "373220.KS": "LG에너지솔루션", "006400.KS": "삼성SDI",
+    "051910.KS": "LG화학",         "096770.KS": "SK이노베이션",
+    "011170.KS": "롯데케미칼",     "010950.KS": "S-Oil",
+    "011790.KS": "SKC",            "003670.KS": "포스코퓨처엠",
+    "361610.KS": "SK아이이테크놀로지","011780.KS": "금호석유",
+    "009830.KS": "한화솔루션",
+    # ── 자동차 / 부품 ──
+    "005380.KS": "현대차",         "000270.KS": "기아",
+    "012330.KS": "현대모비스",     "204320.KS": "만도",
+    "018880.KS": "한온시스템",     "011210.KS": "현대위아",
+    "307950.KS": "현대오토에버",
+    # ── 방산 / 조선 / 중공업 ──
+    "012450.KS": "한화에어로스페이스","047810.KS": "한국항공우주",
+    "079550.KS": "LIG넥스원",      "042660.KS": "한화오션",
+    "009540.KS": "HD한국조선해양", "010620.KS": "HD현대미포",
+    "267250.KS": "HD현대",         "329180.KS": "HD현대중공업",
+    "034020.KS": "두산에너빌리티", "010140.KS": "삼성중공업",
+    "064350.KS": "현대로템",       "272210.KS": "한화시스템",
+    # ── 금융 (은행/지주) ──
+    "105560.KS": "KB금융",         "055550.KS": "신한지주",
+    "086790.KS": "하나금융지주",   "316140.KS": "우리금융지주",
+    "138930.KS": "BNK금융지주",    "175330.KS": "JB금융지주",
+    "024110.KS": "기업은행",       "071050.KS": "한국금융지주",
+    "138040.KS": "메리츠금융지주",
+    # ── 보험 / 증권 / 카드 ──
+    "032830.KS": "삼성생명",       "000810.KS": "삼성화재",
+    "001450.KS": "현대해상",       "005830.KS": "DB손해보험",
+    "006800.KS": "미래에셋증권",   "016360.KS": "삼성증권",
+    "039490.KS": "키움증권",       "005940.KS": "NH투자증권",
+    "088350.KS": "한화생명",       "029780.KS": "삼성카드",
+    "003690.KS": "코리안리",
+    # ── 철강 / 소재 ──
+    "005490.KS": "POSCO홀딩스",    "004020.KS": "현대제철",
+    "010130.KS": "고려아연",
+    # ── 지주회사 ──
+    "034730.KS": "SK",             "003550.KS": "LG",
+    "000880.KS": "한화",           "004990.KS": "롯데지주",
+    "001040.KS": "CJ",             "000210.KS": "DL",
+    "000150.KS": "두산",           "004800.KS": "효성",
+    # ── 건설 ──
+    "000720.KS": "현대건설",       "006360.KS": "GS건설",
+    "047040.KS": "대우건설",       "028050.KS": "삼성엔지니어링",
+    "028260.KS": "삼성물산",
+    # ── 바이오 / 제약 ──
+    "068270.KS": "셀트리온",       "207940.KS": "삼성바이오로직스",
+    "128940.KS": "한미약품",       "000100.KS": "유한양행",
+    "185750.KS": "종근당",         "069620.KS": "대웅제약",
+    "326030.KS": "SK바이오팜",     "302440.KS": "SK바이오사이언스",
+    # ── 인터넷 / 플랫폼 / 게임 ──
+    "035420.KS": "NAVER",          "035720.KS": "카카오",
+    "259960.KS": "크래프톤",       "036570.KS": "엔씨소프트",
+    "251270.KS": "넷마블",         "323410.KS": "카카오뱅크",
+    "377300.KS": "카카오페이",     "018260.KS": "삼성에스디에스",
+    # ── 유통 / 소비재 ──
+    "139480.KS": "이마트",         "023530.KS": "롯데쇼핑",
+    "097950.KS": "CJ제일제당",     "051900.KS": "LG생활건강",
+    "090430.KS": "아모레퍼시픽",   "007070.KS": "GS리테일",
+    "271560.KS": "오리온",         "004370.KS": "농심",
+    "004170.KS": "신세계",         "069960.KS": "현대백화점",
+    "282330.KS": "BGF리테일",      "007310.KS": "오뚜기",
+    "000080.KS": "하이트진로",     "033780.KS": "KT&G",
+    "192820.KS": "코스맥스",
+    # ── 통신 ──
+    "017670.KS": "SK텔레콤",       "030200.KS": "KT",
+    "032640.KS": "LG유플러스",
+    # ── 항공 / 운송 ──
+    "003490.KS": "대한항공",       "086280.KS": "현대글로비스",
+    "011200.KS": "HMM",            "028670.KS": "팬오션",
+    "000120.KS": "CJ대한통운",
+    # ── 미디어 / 엔터 ──
+    "253450.KS": "스튜디오드래곤", "035760.KS": "CJ ENM",
+    # ── 에너지 / 유틸리티 ──
+    "015760.KS": "한국전력",       "078930.KS": "GS",
+    "010060.KS": "OCI홀딩스",
+    # ── 전자 / 가전 ──
+    "066570.KS": "LG전자",
 }
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  HTTP 유틸리티
+# ══════════════════════════════════════════════════════════════════════
+
 def make_session() -> tuple[requests.Session, str]:
-    """크럼 인증 세션 생성."""
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0"})
     s.get("https://fc.yahoo.com", timeout=10)
@@ -215,66 +291,152 @@ def make_session() -> tuple[requests.Session, str]:
     return s, crumb
 
 
-def fetch_marketcaps(session, crumb, tickers: list[str]) -> dict:
-    """여러 종목 시총을 한 번에 조회 (단위: 10억 달러)."""
+def fetch_marketcaps(session, crumb, tickers: list[str], batch_size: int = 40) -> dict:
+    """시총을 배치로 조회 (한 번에 너무 많은 심볼을 요청하면 URL 길이 초과 위험)."""
     caps = {}
-    try:
-        symbols = ",".join(tickers)
-        url = (f"https://query1.finance.yahoo.com/v7/finance/quote"
-               f"?symbols={symbols}&crumb={crumb}")
-        d = session.get(url, timeout=10).json()
-        for q in d["quoteResponse"]["result"]:
-            mc = q.get("marketCap")
-            if mc:
-                caps[q["symbol"]] = mc / 1e9
-    except Exception as e:
-        print(f"  ! 시총 조회 실패: {e}")
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        try:
+            symbols = ",".join(batch)
+            url = (f"https://query1.finance.yahoo.com/v7/finance/quote"
+                   f"?symbols={symbols}&crumb={crumb}")
+            d = session.get(url, timeout=10).json()
+            for q in d["quoteResponse"]["result"]:
+                mc = q.get("marketCap")
+                if mc:
+                    caps[q["symbol"]] = mc / 1e9
+        except Exception as e:
+            print(f"  ! 시총 조회 실패 (배치 {i}): {e}")
     return caps
 
 
 def fetch_fundamentals(session, crumb, ticker: str) -> dict:
-    """ROE·부채비율·매출성장·PER·흑자여부 조회."""
+    """ROE·부채비율·매출성장·PER·PBR·목표주가 조회.
+    summaryDetail + defaultKeyStatistics 두 모듈에서 PBR/PER를 모두 시도해
+    한국 주식처럼 일부 필드가 누락된 경우를 보완한다.
+    """
     try:
         url = (f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
-               f"?modules=financialData,summaryDetail&crumb={crumb}")
+               f"?modules=financialData,summaryDetail,defaultKeyStatistics&crumb={crumb}")
         res = session.get(url, timeout=10).json()["quoteSummary"]["result"][0]
-        fd = res.get("financialData", {})
-        sd = res.get("summaryDetail", {})
+        fd = res.get("financialData",       {})
+        sd = res.get("summaryDetail",       {})
+        ks = res.get("defaultKeyStatistics",{})
 
         def raw(d, k):
             return d.get(k, {}).get("raw") if isinstance(d.get(k), dict) else None
 
+        pbr = raw(sd, "priceToBook") or raw(ks, "priceToBook")
+        per = raw(sd, "trailingPE")  or raw(ks, "trailingPE")
+
         return {
-            "roe": raw(fd, "returnOnEquity"),
-            "debt_equity": raw(fd, "debtToEquity"),
-            "rev_growth": raw(fd, "revenueGrowth"),
+            "roe":           raw(fd, "returnOnEquity"),
+            "debt_equity":   raw(fd, "debtToEquity"),
+            "rev_growth":    raw(fd, "revenueGrowth"),
             "profit_margin": raw(fd, "profitMargins"),
-            "per": raw(sd, "trailingPE"),
+            "per":           per,
+            "pbr":           pbr,
+            "target_mean":   raw(fd, "targetMeanPrice"),
         }
     except Exception:
         return {}
 
 
 def fetch_daily(ticker: str) -> dict | None:
-    """1년치 일봉(종가, 거래량) 조회."""
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        f"?interval=1d&range=1y"
-    )
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?interval=1d&range=1y")
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
-        data = res.json()
-        result = data["chart"]["result"][0]
+        result = res.json()["chart"]["result"][0]
         closes = result["indicators"]["quote"][0]["close"]
-        vols = result["indicators"]["quote"][0]["volume"]
-        # None 값 제거 (휴장/누락)
+        vols   = result["indicators"]["quote"][0]["volume"]
         closes = [c for c in closes if c is not None]
-        vols = [v for v in vols if v is not None]
+        vols   = [v for v in vols   if v is not None]
         return {"close": closes, "volume": vols}
     except Exception as e:
         print(f"  ! {ticker} 조회 실패: {e}")
         return None
 
+
+def to_krx_code(ticker: str) -> str:
+    """005930.KS → 005930"""
+    return ticker.split(".")[0]
+
+
+def _parse_signed_int(text: str) -> int | None:
+    s = text.strip().replace(",", "").replace("+", "")
+    if not s or s == "-":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def fetch_naver_investor_flow(code: str) -> list[dict] | None:
+    """네이버 금융 일별 기관·외국인 순매매량(주). 최신일 → 과거 순.
+
+    Yahoo/pykrx(KRX 로그인 필요) 대신 공개 페이지를 사용한다.
+    장중에는 당일 수치가 미확정일 수 있음(장 마감 후 확정).
+    """
+    url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=12)
+        res.encoding = "euc-kr"
+        soup = BeautifulSoup(res.text, "html.parser")
+        tables = soup.select("table.type2")
+        if len(tables) < 2:
+            return None
+        rows = []
+        for tr in tables[1].select("tr"):
+            tds = tr.select("td")
+            if len(tds) < 7:
+                continue
+            date = tds[0].get_text(strip=True)
+            if not re.match(r"\d{4}\.\d{2}\.\d{2}", date):
+                continue
+            inst = _parse_signed_int(tds[5].get_text())
+            frgn = _parse_signed_int(tds[6].get_text())
+            if inst is None or frgn is None:
+                continue
+            rows.append({"date": date, "inst": inst, "foreign": frgn})
+        return rows or None
+    except Exception as e:
+        print(f"  ! {code} 수급 조회 실패: {e}")
+        return None
+
+
+def summarize_investor_flow(rows: list[dict] | None) -> dict:
+    """5/10/20거래일 기관·외국인 누적 순매수 요약."""
+    empty = {
+        "flow_ok": False,
+        "flow_5d": None, "flow_10d": None, "flow_20d": None,
+        "inst_5d": None, "foreign_5d": None,
+        "inst_20d": None, "foreign_20d": None,
+    }
+    if not rows:
+        return empty
+
+    def _sum(n: int) -> tuple[int, int, int]:
+        sub = rows[:n]
+        inst = sum(r["inst"] for r in sub)
+        frgn = sum(r["foreign"] for r in sub)
+        return inst, frgn, inst + frgn
+
+    i5, f5, t5 = _sum(min(5, len(rows)))
+    _, _, t10 = _sum(min(10, len(rows)))
+    i20, f20, t20 = _sum(min(20, len(rows)))
+    return {
+        "flow_ok": t5 > 0,
+        "flow_5d": t5, "flow_10d": t10, "flow_20d": t20,
+        "inst_5d": i5, "foreign_5d": f5,
+        "inst_20d": i20, "foreign_20d": f20,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  수학 유틸리티
+# ══════════════════════════════════════════════════════════════════════
 
 def sma(values: list[float], window: int) -> float | None:
     if len(values) < window:
@@ -294,11 +456,10 @@ def rsi(values: list[float], period: int = 14) -> float | None:
     avg_loss = sum(losses) / period
     if avg_loss == 0:
         return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def ema(values: list[float], window: int) -> list[float]:
+def _ema(values: list[float], window: int) -> list[float]:
     k = 2 / (window + 1)
     ema_vals = [values[0]]
     for v in values[1:]:
@@ -306,415 +467,627 @@ def ema(values: list[float], window: int) -> list[float]:
     return ema_vals
 
 
-def macd_hist(values: list[float]) -> tuple[float, float] | None:
-    """MACD 히스토그램 (현재, 직전) 반환."""
+def macd_rising(values: list[float]) -> bool:
+    """MACD 히스토그램이 상승 중인지 반환."""
     if len(values) < 35:
-        return None
-    ema12 = ema(values, 12)
-    ema26 = ema(values, 26)
+        return False
+    ema12 = _ema(values, 12)
+    ema26 = _ema(values, 26)
     macd_line = [a - b for a, b in zip(ema12, ema26)]
-    signal = ema(macd_line, 9)
+    signal = _ema(macd_line, 9)
     hist = [m - s for m, s in zip(macd_line, signal)]
-    return hist[-1], hist[-2]
+    return hist[-1] > hist[-2]
 
 
-def ret_20d(closes: list[float]) -> float | None:
-    """20거래일 수익률(%)."""
-    if len(closes) < 21:
+def ret_nd(closes: list[float], n: int = 20) -> float | None:
+    if len(closes) < n + 1:
         return None
-    return (closes[-1] / closes[-21] - 1) * 100
+    return (closes[-1] / closes[-(n + 1)] - 1) * 100
 
 
-def resolve_volume_bars(vols: list[float]) -> tuple[list[float], float | None, float | None, bool]:
-    """거래량 비교용 일봉 정리.
-
-    장중에는 Yahoo 일봉 마지막 봉이 '오늘 미완성' 거래량이라
-    20일 평균(종일)과 직접 비교하면 거의 항상 거래량↓가 된다.
-    → 당일 봉이 미완성으로 보이면 제외하고 **전일 거래량**으로 판단.
-    """
+def resolve_volume_bars(vols: list[float]) -> tuple[list, float | None, float | None, bool]:
+    """장중 미완성 봉 감지 후 전일 거래량으로 대체."""
     if len(vols) < 21:
         return vols, None, None, False
-    vol_avg20_all = sma(vols, 20)
+    vol_avg20 = sma(vols, 20)
     vol_today = vols[-1]
-    intraday = (
-        vol_avg20_all is not None
-        and vol_today is not None
-        and vol_today < vol_avg20_all * INCOMPLETE_VOL_RATIO
-    )
+    intraday = (vol_avg20 is not None and vol_today is not None
+                and vol_today < vol_avg20 * INCOMPLETE_VOL_RATIO)
     if intraday:
         completed = vols[:-1]
-        vol_ref = vols[-2] if len(vols) >= 2 else None
+        vol_ref   = vols[-2] if len(vols) >= 2 else None
         vol_avg20 = sma(completed, 20) if len(completed) >= 20 else None
     else:
         completed = vols
-        vol_ref = vols[-1]
-        vol_avg20 = vol_avg20_all
+        vol_ref   = vols[-1]
     return completed, vol_ref, vol_avg20, intraday
 
 
-def check_market_regime() -> dict:
-    """시장 레짐 판단: 지수(QQQ)가 50일선 위 + 50일선 우상향이면 'risk-on'."""
-    d = fetch_daily(MARKET_INDEX)
+# ══════════════════════════════════════════════════════════════════════
+#  시장 레짐 판단
+# ══════════════════════════════════════════════════════════════════════
+
+def check_regime(index_ticker: str) -> dict:
+    d = fetch_daily(index_ticker)
     if not d or len(d["close"]) < 55:
-        # 데이터 못 받으면 보수적으로 통과(차단하지 않음)
-        return {"ok": True, "price": None, "ma50": None, "reason": "데이터없음(통과)"}
+        return {"ok": True, "price": None, "ma20": None, "ma50": None,
+                "reason": "데이터없음(통과)", "ret_20d": None}
     closes = d["close"]
-    price = closes[-1]
-    ma50 = sma(closes, 50)
-    ma50_prev = sma(closes[:-5], 50)
-    above_50 = ma50 is not None and price > ma50
-    rising_50 = ma50_prev is not None and ma50 > ma50_prev
+    price  = closes[-1]
+    ma20   = sma(closes, 20)
+    ma50   = sma(closes, 50)
+    ma50_5d = sma(closes[:-5], 50)
+    above_50  = ma50  is not None and price > ma50
+    rising_50 = ma50_5d is not None and ma50 > ma50_5d
     ok = above_50 and rising_50
-    reason = "위험(지수 약세)" if not ok else "양호(지수 강세)"
-    bench_ret = ret_20d(closes)
-    return {"ok": ok, "price": price, "ma50": ma50,
-            "above_50": above_50, "rising_50": rising_50, "reason": reason,
-            "ret_20d": bench_ret}
+    reason = "약세 (50MA 이탈)" if not ok else "강세 (50MA 위)"
+    return {"ok": ok, "price": price, "ma20": ma20, "ma50": ma50,
+            "reason": reason, "ret_20d": ret_nd(closes, 20)}
 
 
-def analyze(ticker: str, name: str, marketcap: float | None = None,
-            fund: dict | None = None, market_ok: bool = True,
-            benchmark_ret_20d: float | None = None) -> dict | None:
+# ══════════════════════════════════════════════════════════════════════
+#  나스닥 종목 분석
+# ══════════════════════════════════════════════════════════════════════
+
+def analyze_nasdaq(ticker: str, name: str, cap: float | None,
+                   fund: dict, regime_ok: bool,
+                   benchmark_ret: float | None) -> dict | None:
     d = fetch_daily(ticker)
     if not d or len(d["close"]) < 60:
         return None
     closes = d["close"]
-    vols = d["volume"]
-    price = closes[-1]
+    vols   = d["volume"]
+    price  = closes[-1]
 
-    ma5 = sma(closes, 5)
-    ma20 = sma(closes, 20)
-    ma50 = sma(closes, 50)
+    ma5   = sma(closes, 5)
+    ma20  = sma(closes, 20)
+    ma50  = sma(closes, 50)
     ma200 = sma(closes, 200)
-
-    # 기울기: 5거래일 전 이동평균과 비교
-    ma5_prev = sma(closes[:-5], 5) if len(closes) > 10 else None
-    ma20_prev = sma(closes[:-5], 20) if len(closes) > 25 else None
-    ma50_prev = sma(closes[:-5], 50) if len(closes) > 55 else None
+    ma50_5d = sma(closes[:-5], 50) if len(closes) > 55 else None
 
     r = rsi(closes, 14)
-    mh = macd_hist(closes)
-    completed_vols, vol_ref, vol_avg20, vol_intraday = resolve_volume_bars(vols)
-    vol_avg5 = sma(completed_vols, 5) if len(completed_vols) >= 5 else None
-    high_52w = max(closes)
+
+    completed, vol_ref, vol_avg20, vol_intraday = resolve_volume_bars(vols)
+    vol_avg5 = sma(completed, 5) if len(completed) >= 5 else None
+    vol_ratio_5d = (vol_avg5 / vol_avg20) if (vol_avg5 and vol_avg20) else None
+
+    high_52w = max(closes[-252:]) if len(closes) >= 252 else max(closes)
     from_high = (price - high_52w) / high_52w * 100
 
-    checks = {}
-    # 추세(대형 프레임)
-    checks["주가>50일선>200일선"] = (
-        ma50 is not None and ma200 is not None and price > ma50 > ma200
-    )
-    checks["50일선 우상향"] = ma50_prev is not None and ma50 > ma50_prev
-    checks["52주고점 -30% 이내"] = from_high >= -30
-    # 단기 스윙
-    checks["주가>5일선"] = ma5 is not None and price > ma5
-    checks["5일선 우상향"] = ma5_prev is not None and ma5 > ma5_prev
-    checks["5일선>20일선(골든)"] = ma5 is not None and ma20 is not None and ma5 > ma20
-    checks["완전정배열(5>20>50)"] = (
-        ma5 is not None and ma20 is not None and ma50 is not None
-        and ma5 > ma20 > ma50
-    )
-    # 모멘텀
-    checks[f"RSI {RSI_MIN}~{RSI_MAX}"] = r is not None and RSI_MIN <= r <= RSI_MAX
-    rsi_key = f"RSI {RSI_MIN}~{RSI_MAX}"
-    checks["MACD 히스토 상승"] = mh is not None and mh[0] > mh[1]
-    checks["거래량>20일평균"] = (
-        vol_ref is not None and vol_avg20 is not None
-        and vol_ref > vol_avg20 * VOLUME_MULT
-    )
+    recent_20   = closes[-20:] if len(closes) >= 20 else closes
+    range_20d   = ((max(recent_20) - min(recent_20)) / price * 100) if price else None
+    ret_stock   = ret_nd(closes, 20)
 
-    score = sum(1 for v in checks.values() if v)
+    ext_5ma   = ((price - ma5) / ma5 * 100)    if ma5  else None
+    ext_5_20  = ((ma5 - ma20)  / ma20 * 100)   if (ma5 and ma20)  else None
+    ext_20_50 = ((ma20 - ma50) / ma50 * 100)   if (ma20 and ma50) else None
 
-    # ── 진입 적격 판정 (사람 판단을 코드화) ──
-    # 1) 상승 추세 배경: 주가>50>200 & 50일선 우상향
-    trend_ok = checks["주가>50일선>200일선"] and checks["50일선 우상향"]
-    # 2) RSI 건전: 40~70 (과매수 추격 차단)
-    rsi_ok = checks[rsi_key]
-    # 3) 단기 정배열: 5일선>20일선, 그리고 완전 정배열(5>20>50) 유지
-    short_ok = checks["5일선>20일선(골든)"] and checks["완전정배열(5>20>50)"]
-    # 4) 진입 여력: 신고점 과열 아님 (RSI 상한 이내)
-    not_overbought = r is not None and r <= RSI_MAX
-    ext_5ma = ((price - ma5) / ma5 * 100) if ma5 else 0  # 주가 vs 5일선 이격도
-    ext_5_20 = ((ma5 - ma20) / ma20 * 100) if (ma5 and ma20) else 0  # 5일선 vs 20일선 이격
+    # 추세: 주가 > 50MA, 50MA 우상향
+    above_50ma  = ma50  is not None and price > ma50
+    above_200ma = ma200 is not None and price > ma200
+    ma50_rising = ma50_5d is not None and ma50 > ma50_5d
+    trend_ok    = above_50ma and ma50_rising
 
-    # ── 1단계 펀더멘털 필터 ──
-    fund = fund or {}
-    roe = fund.get("roe")
-    dte = fund.get("debt_equity")
-    rev_g = fund.get("rev_growth")
-    pmargin = fund.get("profit_margin")
-    per = fund.get("per")
+    # 5>20>50 정배열
+    aligned = (ma5 and ma20 and ma50 and ma5 > ma20 > ma50)
 
-    # 필수 조건: 부채비율 + 매출성장(역성장 아님). 부채 데이터 없으면 통과로 간주.
-    f_debt = dte is None or dte <= MAX_DEBT_EQUITY
-    f_growth = rev_g is not None and rev_g > 0
-    # 수익성/성장 경로 (하나 이상)
-    p_roe = roe is not None and roe >= MIN_ROE          # ① 수익성
-    p_profit = pmargin is not None and pmargin > 0       # ② 흑자
-    p_hyper = rev_g is not None and rev_g >= HIGH_GROWTH # ③ 초고성장
-    quality_ok = p_roe or p_profit or p_hyper
+    # QQQ 상대강도
+    rs_ok = (ret_stock is not None and benchmark_ret is not None
+             and ret_stock > benchmark_ret)
 
-    fundamental_pass = f_debt and f_growth and quality_ok
-    fund_checks = {f"부채비율≤{MAX_DEBT_EQUITY:.0f}%": f_debt, "매출성장": f_growth,
-                   "수익성/성장(ROE10%or흑자or성장30%)": quality_ok}
+    # 기본 필터
+    cap_ok   = cap is None or cap >= ND_MIN_CAP_B
+    price_ok = price <= ND_MAX_PRICE
+    dte      = fund.get("debt_equity")
+    debt_ok  = dte is None or dte <= ND_MAX_DEBT
 
-    # 시총·단가 필터
-    cap_ok = (
-        marketcap is None
-        or (MIN_MARKETCAP_B <= marketcap <= MAX_MARKETCAP_B)
-        or (ticker in CAP_EXEMPT and marketcap >= MIN_MARKETCAP_B)
-    )
-    price_ok = price <= MAX_PRICE or ticker in CAP_EXEMPT
+    entry_type = None
+    if trend_ok and cap_ok and price_ok and debt_ok:
 
-    # 지금 당장 진입: 주가가 5일선 위(단기 모멘텀 확인) + 거래량 동반
-    above_5ma = checks["주가>5일선"]
-    vol_ok = checks["거래량>20일평균"]
-    # 5일선 이격 상한: 너무 멀리 떨어져 오른 종목은 '추격'으로 제외 (되돌림 방지)
-    ext_ok = ext_5ma <= MAX_EXT_5MA
-
-    pullback_grade = (trend_ok and rsi_ok and short_ok and not_overbought
-                      and cap_ok and price_ok and above_5ma and ext_ok)
-    if REQUIRE_VOLUME:
-        pullback_grade = pullback_grade and vol_ok
-    if REQUIRE_FUNDAMENTAL:
-        pullback_grade = pullback_grade and fundamental_pass
-    if REQUIRE_MARKET_REGIME:
-        pullback_grade = pullback_grade and market_ok
-
-    # ── 모멘텀 적격: 가속·신고가 근처·거래량·상대강도 ──
-    stock_ret_20d = ret_20d(closes)
-    mom_ext_ok = MIN_EXT_5MA_MOM <= ext_5ma <= MAX_EXT_5MA_MOM
-    mom_ma_spread_ok = ext_5_20 <= MAX_MA5_20_SPREAD
-    mom_rsi_ok = r is not None and MOM_RSI_MIN <= r <= MOM_RSI_MAX
-    mom_near_high = from_high >= MOM_FROM_HIGH
-    mom_vol_ok = (
-        vol_avg5 is not None and vol_avg20 is not None
-        and vol_avg5 > vol_avg20 * MOM_VOLUME_MULT
-    )
-    rs_ok = True
-    if MOM_REQUIRE_RS and benchmark_ret_20d is not None and stock_ret_20d is not None:
-        rs_ok = stock_ret_20d > benchmark_ret_20d
-
-    momentum_grade = (trend_ok and short_ok and above_5ma and mom_ext_ok
-                      and mom_ma_spread_ok and mom_rsi_ok and mom_near_high
-                      and mom_vol_ok and checks["MACD 히스토 상승"] and rs_ok
-                      and cap_ok and price_ok)
-    if REQUIRE_FUNDAMENTAL:
-        momentum_grade = momentum_grade and fundamental_pass
-    if REQUIRE_MARKET_REGIME:
-        momentum_grade = momentum_grade and market_ok
-
-    # 눌림목 점수: RSI가 45~60 중앙일수록, 5일선 이격이 작을수록 우수
-    pullback_quality = 0.0
-    if pullback_grade:
-        pullback_quality = 100 - abs(r - 52) - abs(ext_5ma) * 2
-
-    # 모멘텀 점수: 이격·거래량·신고가 근접·RSI 강세
-    momentum_quality = 0.0
-    if momentum_grade:
-        vr = (vol_avg5 / vol_avg20) if (vol_avg5 and vol_avg20) else 1
-        vol_score = min(vr * 10, 30)
-        momentum_quality = (
-            min(ext_5ma, MAX_EXT_5MA_MOM) * 2
-            + min(-from_high, 5) * 3
-            + min(MAX_MA5_20_SPREAD - ext_5_20, 5) * 2
-            + vol_score
-            + (r - MOM_RSI_MIN) * 0.5
+        # ① 눌림목: 5MA 근처 + RSI 건강 + 거래량 수축
+        pb_ok = (
+            ext_5ma is not None and abs(ext_5ma) <= PB_5MA_RANGE
+            and ext_5_20 is not None and ext_5_20 > -PB_FROM_20MA
+            and r is not None and PB_RSI_MIN <= r <= PB_RSI_MAX
+            and (vol_ratio_5d is None or vol_ratio_5d <= PB_VOL_MAX)
         )
 
-    entry_grade = pullback_grade  # 하위 호환
+        # ② 돌파: 52주 고점 근접 + 거래량 급증
+        bk_ok = (
+            from_high >= BK_FROM_HIGH
+            and r is not None and BK_RSI_MIN <= r <= BK_RSI_MAX
+            and vol_ratio_5d is not None and vol_ratio_5d >= BK_VOL_MIN
+            and above_200ma
+            and ma20 is not None and price > ma20
+        )
+
+        # ③ 에너지응축: MA 간격 좁음 + 레인지 압축
+        sq_ok = (
+            ext_5_20  is not None and abs(ext_5_20)  <= SQ_5_20_MAX
+            and ext_20_50 is not None and abs(ext_20_50) <= SQ_20_50_MAX
+            and range_20d  is not None and range_20d  <= SQ_RANGE_MAX
+            and r is not None and SQ_RSI_MIN <= r <= SQ_RSI_MAX
+        )
+
+        if pb_ok:
+            entry_type = "눌림목"
+        elif bk_ok:
+            entry_type = "돌파"
+        elif sq_ok:
+            entry_type = "에너지응축"
+
+    # RS 점수 (전체 순위 비교용)
+    rs_score = ret_stock if ret_stock is not None else -999
 
     return {
-        "ticker": ticker, "name": name, "price": price,
-        "marketcap": marketcap, "cap_ok": cap_ok, "price_ok": price_ok,
-        "roe": roe, "debt_equity": dte, "rev_growth": rev_g, "per": per,
-        "fundamental_pass": fundamental_pass, "fund_checks": fund_checks,
-        "ma5": ma5, "ma20": ma20, "ma50": ma50, "ma200": ma200,
-        "rsi": r, "macd_hist": mh[0] if mh else None,
-        "from_high": from_high, "ext_5ma": ext_5ma, "ext_5_20": ext_5_20,
-        "ext_ok": ext_ok, "mom_ma_spread_ok": mom_ma_spread_ok,
-        "ret_20d": stock_ret_20d,
-        "vol_ratio": (vol_ref / vol_avg20) if (vol_ref and vol_avg20) else None,
-        "vol_ratio_5d": (vol_avg5 / vol_avg20) if (vol_avg5 and vol_avg20) else None,
+        "ticker": ticker, "name": name, "price": price, "cap": cap,
+        "rsi": r, "from_high": from_high,
+        "ext_5ma": ext_5ma, "ext_5_20": ext_5_20, "ext_20_50": ext_20_50,
+        "range_20d": range_20d, "vol_ratio_5d": vol_ratio_5d,
+        "ret_20d": ret_stock, "rs_ok": rs_ok, "rs_score": rs_score,
+        "trend_ok": trend_ok, "aligned": aligned,
+        "above_50ma": above_50ma, "above_200ma": above_200ma,
+        "cap_ok": cap_ok, "price_ok": price_ok, "debt_ok": debt_ok,
+        "entry_type": entry_type, "regime_ok": regime_ok,
+        "ma5": ma5, "ma20": ma20, "ma50": ma50,
+        "roe": fund.get("roe"), "debt_equity": dte,
+        "rev_growth": fund.get("rev_growth"),
+        "per": fund.get("per"),
         "vol_intraday": vol_intraday,
-        "checks": checks, "score": score,
-        "pullback_grade": pullback_grade, "momentum_grade": momentum_grade,
-        "entry_grade": entry_grade,
-        "pullback_quality": pullback_quality, "momentum_quality": momentum_quality,
     }
 
 
-def fmt(v, suffix="", nd=2):
+# ══════════════════════════════════════════════════════════════════════
+#  코스피 종목 분석
+# ══════════════════════════════════════════════════════════════════════
+
+def analyze_kospi(ticker: str, name: str, fund: dict,
+                  regime_ok: bool, benchmark_ret: float | None,
+                  flow: dict | None = None) -> dict | None:
+    d = fetch_daily(ticker)
+    if not d or len(d["close"]) < 40:
+        return None
+    closes = d["close"]
+    vols   = d["volume"]
+    price  = closes[-1]
+
+    ma20  = sma(closes, 20)
+    ma50  = sma(closes, 50)
+    ma200 = sma(closes, 200)
+    ma50_5d = sma(closes[:-5], 50) if len(closes) > 55 else None
+
+    r = rsi(closes, 14)
+
+    completed, _, vol_avg20, vol_intraday = resolve_volume_bars(vols)
+    vol_avg5 = sma(completed, 5) if len(completed) >= 5 else None
+    vol_ratio_5d = (vol_avg5 / vol_avg20) if (vol_avg5 and vol_avg20) else None
+
+    high_52w = max(closes[-252:]) if len(closes) >= 252 else max(closes)
+    low_52w  = min(closes[-252:]) if len(closes) >= 252 else min(closes)
+    from_high = (price - high_52w) / high_52w * 100
+    from_low  = (price - low_52w)  / low_52w  * 100
+
+    ret_stock = ret_nd(closes, 20)
+    rs_ok = (ret_stock is not None and benchmark_ret is not None
+             and ret_stock > benchmark_ret)
+
+    fund  = fund or {}
+    pbr   = fund.get("pbr")
+    per   = fund.get("per")
+    roe   = fund.get("roe")
+    dte   = fund.get("debt_equity")
+    rg    = fund.get("rev_growth")
+    pm    = fund.get("profit_margin")
+    tgt   = fund.get("target_mean")
+
+    # 목표주가 괴리율 (목표가 / 현재가 - 1)
+    tgt_gap = ((tgt / price) - 1) if (tgt and price and tgt > 0) else None
+
+    flow = flow or summarize_investor_flow(None)
+
+    # ── 10점 만점 점수화 ──────────────────────────────────────────
+    score = 0
+
+    # 가치/안전마진 (최대 3점)
+    if pbr is not None:
+        if pbr <= KS_PBR_GOOD:   score += 2
+        elif pbr <= KS_PBR_MAX:  score += 1
+    if per is not None and 0 < per <= KS_PER_GOOD:
+        score += 1
+
+    # 실적/성장 (최대 4점)
+    if rg  is not None and rg > 0:                        score += 1
+    if pm  is not None and pm > 0:                        score += 1
+    if tgt_gap is not None and tgt_gap >= KS_TGT_GAP:    score += 2
+
+    # 수급/기술 (최대 3점) — 수급은 네이버 기관·외국인 순매수 (거래량 근사 금지)
+    if ma20 is not None and price > ma20:                  score += 1
+    if r    is not None and KS_RSI_MIN <= r <= KS_RSI_MAX: score += 1
+    if flow.get("flow_ok"):                                score += 1
+
+    # ── 필수 탈락 기준 ──────────────────────────────────────────
+    debt_ok  = dte is None or dte <= KS_DEBT_MAX
+    roe_ok   = roe is None or roe >= KS_ROE_MIN
+    pbr_pass = pbr is None or pbr <= KS_PBR_MAX
+    per_pass = per is None or per <= KS_PER_MAX
+    qualified = debt_ok and roe_ok and pbr_pass and per_pass
+
+    exclude_reason = None
+    if   not debt_ok:  exclude_reason = f"부채과다 ({dte:.0f}%)"
+    elif not roe_ok:   exclude_reason = f"ROE 부족 ({roe*100:.1f}%)"
+    elif not pbr_pass: exclude_reason = f"PBR 고평가 ({pbr:.2f})"
+    elif not per_pass: exclude_reason = f"PER 고평가 ({per:.1f})"
+
+    # ── 카테고리 분류 ────────────────────────────────────────────
+    if not qualified or score < 4:
+        category = "조건 미달"
+    elif score >= 7:
+        category = "우선 후보"
+    elif score >= 5:
+        category = "관찰 후보"
+    else:
+        category = "조건 미달"
+
+    return {
+        "ticker": ticker, "name": name, "price": price,
+        "rsi": r, "from_high": from_high, "from_low": from_low,
+        "vol_ratio_5d": vol_ratio_5d, "ret_20d": ret_stock,
+        "rs_ok": rs_ok,
+        "ma20": ma20, "ma50": ma50, "ma200": ma200,
+        "above_20ma": (ma20 is not None and price > ma20),
+        "pbr": pbr, "per": per, "roe": roe, "dte": dte,
+        "rev_growth": rg, "profit_margin": pm,
+        "target_mean": tgt, "tgt_gap": tgt_gap,
+        "score": score, "category": category,
+        "qualified": qualified, "exclude_reason": exclude_reason,
+        "vol_intraday": vol_intraday, "regime_ok": regime_ok,
+        **flow,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  병렬 조회 워커
+# ══════════════════════════════════════════════════════════════════════
+MAX_WORKERS = 12  # 동시 조회 스레드 수 (Yahoo 과도한 동시요청 방지)
+
+
+def _nasdaq_worker(session, crumb, tick, name, cap, regime_ok, bench):
+    try:
+        fund = fetch_fundamentals(session, crumb, tick)
+        return analyze_nasdaq(tick, name, cap, fund, regime_ok, bench)
+    except Exception as e:
+        print(f"  ! {tick} 분석 실패: {e}")
+        return None
+
+
+def _kospi_worker(session, crumb, tick, name, regime_ok, bench):
+    try:
+        fund = fetch_fundamentals(session, crumb, tick)
+        flow = summarize_investor_flow(
+            fetch_naver_investor_flow(to_krx_code(tick))
+        )
+        return analyze_kospi(tick, name, fund, regime_ok, bench, flow)
+    except Exception as e:
+        print(f"  ! {tick} 분석 실패: {e}")
+        return None
+
+
+def _run_parallel(worker, session, crumb, items: list[tuple], regime_ok, bench) -> list:
+    """items: (ticker, name, extra) 또는 (ticker, name) 튜플 리스트."""
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(worker, session, crumb, *item, regime_ok, bench): item[0]
+                   for item in items}
+        for fut in cf.as_completed(futures):
+            a = fut.result()
+            if a:
+                results.append(a)
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  출력 유틸리티
+# ══════════════════════════════════════════════════════════════════════
+
+def _f(v, suffix="", nd=2, scale=1):
     if v is None:
         return "N/A"
-    return f"{v:,.{nd}f}{suffix}"
+    return f"{v * scale:,.{nd}f}{suffix}"
 
 
-def print_stock_block(a: dict, quality: float, quality_label: str):
-    cap_str = f"${a['marketcap']:,.0f}B" if a['marketcap'] else "N/A"
-    print(f"\n  {a['name']} ({a['ticker']})   점수 {a['score']}/{len(a['checks'])} | "
-          f"{quality_label} {quality:.0f} | 시총 {cap_str}")
-    print(f"    현재가 ${fmt(a['price'])} | RSI {fmt(a['rsi'], nd=1)} | "
-          f"고점대비 {fmt(a['from_high'], '%', 1)} | "
-          f"5일선이격 {fmt(a['ext_5ma'], '%', 1)} | "
-          f"5-20MA {fmt(a.get('ext_5_20'), '%', 1)} | "
-          f"거래량(5d) {fmt(a.get('vol_ratio_5d'), 'x', 2)}")
-    ret_s = f"{a['ret_20d']:.1f}%" if a.get('ret_20d') is not None else "N/A"
-    print(f"    20일수익률 {ret_s} | "
-          f"5MA ${fmt(a['ma5'])} | 20MA ${fmt(a['ma20'])} | 50MA ${fmt(a['ma50'])}")
-    roe_s = f"{a['roe']*100:.1f}%" if a['roe'] is not None else "N/A"
-    dte_s = f"{a['debt_equity']:.0f}%" if a['debt_equity'] is not None else "N/A"
-    rg_s = f"{a['rev_growth']*100:.1f}%" if a['rev_growth'] is not None else "N/A"
-    per_s = f"{a['per']:.1f}" if a['per'] is not None else "N/A"
-    print(f"    [펀더멘털] ROE {roe_s} | 부채비율 {dte_s} | "
-          f"매출성장 {rg_s} | PER {per_s}")
+def _sep(char="═", width=78):
+    print(char * width)
 
 
-def exclusion_tag(a: dict, market_ok: bool) -> str:
-    rsi_key = f"RSI {RSI_MIN}~{RSI_MAX}"
-    if a["pullback_grade"]:
-        return "★눌림"
-    if a["momentum_grade"]:
-        return "☆모멘"
-    if not a["cap_ok"]:
-        return "시총↓" if (a["marketcap"] and a["marketcap"] < MIN_MARKETCAP_B) else "시총↑"
-    if not a["price_ok"]:
-        return "단가↑"
-    if REQUIRE_MARKET_REGIME and not market_ok:
-        return "시장위험"
-    if REQUIRE_FUNDAMENTAL and not a["fundamental_pass"]:
-        failed = [k for k, v in a["fund_checks"].items() if not v]
-        return "펀더:" + (failed[0] if failed else "?")
-    if not a["checks"]["완전정배열(5>20>50)"]:
-        return "정배열X"
-    if not a["checks"]["주가>5일선"]:
-        return "5MA아래"
-    # 모멘텀 구간 판정 (주가/5MA 4% 이상)
-    if a["ext_5ma"] > MAX_EXT_5MA_MOM:
-        return "이격↑"
-    if a["ext_5ma"] >= MIN_EXT_5MA_MOM and not a.get("mom_ma_spread_ok", True):
-        return "5-20↑"
-    if a["ext_5ma"] < MIN_EXT_5MA_MOM and not a.get("ext_ok", True):
-        return "이격↑"  # 눌림목: 5MA 대비 +4% 초과
-    if REQUIRE_VOLUME and not a["checks"].get("거래량>20일평균", False):
-        return "거래량↓"
-    if a["ext_5ma"] < MIN_EXT_5MA_MOM:
-        return "가속↓"
-    if not a["checks"].get(rsi_key, False) and (a["rsi"] or 0) < MOM_RSI_MIN:
-        return "RSI↓"
-    if a["rsi"] and a["rsi"] > MOM_RSI_MAX:
-        return "RSI↑"
-    if a["from_high"] < MOM_FROM_HIGH:
-        return "고점↓"
-    vol_r = a.get("vol_ratio_5d") or a.get("vol_ratio")
-    if vol_r is not None and vol_r < MOM_VOLUME_MULT:
-        return "거래량↓"
-    return "추세"
+def _print_nasdaq_stock(a: dict):
+    rs_mark = "RS▲" if a.get("rs_ok") else "RS▼"
+    intraday = " [장중추정]" if a.get("vol_intraday") else ""
+    cap_s = f"${a['cap']:,.0f}B" if a.get("cap") else "N/A"
+    print(f"\n  {a['name']} ({a['ticker']})  시총 {cap_s}  [{a['entry_type']}]  {rs_mark}")
+    print(f"    현재가 ${_f(a['price'])}  RSI {_f(a['rsi'],nd=1)}  5MA이격 {_f(a['ext_5ma'],'%',1)}"
+          f"  5-20MA {_f(a['ext_5_20'],'%',1)}  고점대비 {_f(a['from_high'],'%',1)}")
+    print(f"    5d거래량 {_f(a['vol_ratio_5d'],'x',2)}{intraday}"
+          f"  20일수익률 {_f(a['ret_20d'],'%',1)}"
+          f"  20일레인지 {_f(a['range_20d'],'%',1)}")
+    print(f"    5MA ${_f(a['ma5'])}  20MA ${_f(a['ma20'])}  50MA ${_f(a['ma50'])}")
+    roe_s = _f(a['roe'], '%', 1, 100)
+    dte_s = _f(a['debt_equity'], '%', 0)
+    rg_s  = _f(a['rev_growth'],  '%', 1, 100)
+    print(f"    [펀더] ROE {roe_s}  부채비율 {dte_s}  매출성장 {rg_s}  PER {_f(a['per'],nd=1)}")
 
 
-def main():
-    print("\n" + "=" * 78)
-    print("  스윙 매매 기술적 스크리너 — 듀얼 모드 (눌림목 + 모멘텀)")
-    exempt = f" (예외:{','.join(sorted(CAP_EXEMPT))})" if CAP_EXEMPT else ""
-    vol_line = f" | 거래량≥{VOLUME_MULT}x" if REQUIRE_VOLUME else ""
-    print(f"  [눌림목] 시총 ${MIN_MARKETCAP_B}~${MAX_MARKETCAP_B}B{exempt} | 단가≤${MAX_PRICE} | "
-          f"RSI {RSI_MIN}~{RSI_MAX} | 5MA이격≤{MAX_EXT_5MA}%{vol_line}")
-    print(f"  [모멘텀] 주가/5MA {MIN_EXT_5MA_MOM}~{MAX_EXT_5MA_MOM}% | 5-20MA≤{MAX_MA5_20_SPREAD}% | "
-          f"RSI {MOM_RSI_MIN}~{MOM_RSI_MAX} | 고점≥{MOM_FROM_HIGH}% | "
-          f"거래량≥{MOM_VOLUME_MULT}x | RS>QQQ")
-    print("=" * 78)
+def _fmt_shares(n) -> str:
+    """순매수 주수 → +1.2백만 / -85만 등."""
+    if n is None:
+        return "N/A"
+    sign = "+" if n > 0 else ""
+    abs_n = abs(n)
+    if abs_n >= 1_000_000:
+        return f"{sign}{n/1_000_000:.1f}백만"
+    if abs_n >= 10_000:
+        return f"{sign}{n/10_000:.0f}만"
+    return f"{sign}{n:,}"
+
+
+def _print_kospi_stock(a: dict):
+    rs_mark  = "RS▲" if a.get("rs_ok") else "RS▼"
+    above_ma = "20MA▲" if a.get("above_20ma") else "20MA▼"
+    tgt_s    = f"  목표주가괴리 +{a['tgt_gap']*100:.0f}%" if a.get("tgt_gap") else ""
+    flow_mark = "수급▲" if a.get("flow_ok") else "수급▼"
+    print(f"\n  {a['name']} ({a['ticker']})  [{a['category']}]  점수 {a['score']}/10"
+          f"  {rs_mark}  {above_ma}  {flow_mark}{tgt_s}")
+    price_s = f"{a['price']:,.0f}원"
+    print(f"    현재가 {price_s}  RSI {_f(a['rsi'],nd=1)}"
+          f"  고점대비 {_f(a['from_high'],'%',1)}"
+          f"  저점대비 +{_f(a['from_low'],'%',1)}")
+    print(f"    [수급] 5일 합산 {_fmt_shares(a.get('flow_5d'))}"
+          f" (기관 {_fmt_shares(a.get('inst_5d'))}"
+          f" / 외인 {_fmt_shares(a.get('foreign_5d'))})"
+          f"  20일 합산 {_fmt_shares(a.get('flow_20d'))}")
+    print(f"    5d거래량 {_f(a['vol_ratio_5d'],'x',2)}"
+          f"  20일수익률 {_f(a['ret_20d'],'%',1)}")
+    pbr_s = _f(a['pbr'], nd=2)
+    per_s = _f(a['per'], nd=1)
+    roe_s = _f(a['roe'], '%', 1, 100)
+    dte_s = _f(a['dte'], '%', 0)
+    rg_s  = _f(a['rev_growth'], '%', 1, 100)
+    pm_s  = _f(a['profit_margin'], '%', 1, 100)
+    print(f"    [펀더] PBR {pbr_s}  PER {per_s}  ROE {roe_s}"
+          f"  부채비율 {dte_s}  매출성장 {rg_s}  영업이익률 {pm_s}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  나스닥 메인 루틴
+# ══════════════════════════════════════════════════════════════════════
+
+def run_nasdaq():
+    _sep()
+    print("  나스닥 매수 후보발굴 스크리너")
+    print(f"  기준: QQQ 상대강도 · 눌림목(5MA±{PB_5MA_RANGE}%·RSI {PB_RSI_MIN}~{PB_RSI_MAX}·거래량수축)")
+    print(f"       돌파(고점{BK_FROM_HIGH}%이내·RSI {BK_RSI_MIN}~{BK_RSI_MAX}·거래량≥{BK_VOL_MIN}x)")
+    print(f"       에너지응축(5-20MA≤{SQ_5_20_MAX}%·20일레인지≤{SQ_RANGE_MAX}%·RSI {SQ_RSI_MIN}~{SQ_RSI_MAX})")
+    _sep()
 
     session, crumb = make_session()
 
-    # 시장 레짐 판단 (지수 약세면 전 종목 진입 보류)
-    regime = check_market_regime()
-    market_ok = regime["ok"] or not REQUIRE_MARKET_REGIME
-    reg_price = fmt(regime.get("price"))
-    reg_ma50 = fmt(regime.get("ma50"))
+    regime = check_regime(NASDAQ_INDEX)
     flag = "🟢 진입 허용" if regime["ok"] else "🔴 진입 보류"
-    bench_ret = regime.get("ret_20d")
-    bench_ret_s = f"{bench_ret:.1f}%" if bench_ret is not None else "N/A"
-    print(f"  [시장 레짐] {MARKET_INDEX} {reg_price} vs 50일선 {reg_ma50} "
-          f"→ {regime['reason']}  {flag} | QQQ 20일 {bench_ret_s}")
-    if REQUIRE_MARKET_REGIME and not regime["ok"]:
-        print("  ⚠ 지수 약세 → 눌림목·모멘텀 모두 진입 보류.")
-    print("=" * 78)
+    print(f"  [시장 레짐] QQQ {_f(regime['price'])} / 50MA {_f(regime['ma50'])} "
+          f"→ {regime['reason']}  {flag}  QQQ 20일 {_f(regime['ret_20d'],'%',1)}")
+    if not regime["ok"]:
+        print("  ⚠ QQQ 50MA 이탈 — 후보는 표시하되 실제 진입은 50MA 회복 후 권장.")
+    _sep()
 
-    caps = fetch_marketcaps(session, crumb, list(CANDIDATES.keys()))
+    print(f"  종목 {len(NASDAQ_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
+    caps  = fetch_marketcaps(session, crumb, list(NASDAQ_CANDIDATES.keys()))
+    bench = regime["ret_20d"]
 
-    results = []
-    for tick, name in CANDIDATES.items():
-        fund = fetch_fundamentals(session, crumb, tick)
-        a = analyze(tick, name, caps.get(tick), fund, market_ok=market_ok,
-                    benchmark_ret_20d=bench_ret)
-        if a:
-            results.append(a)
+    items = [(tick, name, caps.get(tick)) for tick, name in NASDAQ_CANDIDATES.items()]
+    results = _run_parallel(_nasdaq_worker, session, crumb, items, regime["ok"], bench)
 
-    pullbacks = sorted(
-        [a for a in results if a["pullback_grade"]],
-        key=lambda x: (x["pullback_quality"], x["score"]), reverse=True,
-    )
-    momentums = sorted(
-        [a for a in results if a["momentum_grade"]],
-        key=lambda x: (x["momentum_quality"], x["score"]), reverse=True,
-    )
-    results.sort(
-        key=lambda x: (x["pullback_grade"], x["momentum_grade"],
-                       x["pullback_quality"], x["momentum_quality"], x["score"]),
-        reverse=True,
-    )
+    pullbacks  = [a for a in results if a["entry_type"] == "눌림목"]
+    breakouts  = [a for a in results if a["entry_type"] == "돌파"]
+    squeezes   = [a for a in results if a["entry_type"] == "에너지응축"]
 
-    print(f"\n{'='*78}")
-    print(f"  ★ 눌림목 적격 (5MA이격≤{MAX_EXT_5MA}%, RSI {RSI_MIN}~{RSI_MAX}): {len(pullbacks)}개")
-    print("=" * 78)
-    for a in pullbacks:
-        print_stock_block(a, a["pullback_quality"], "눌림목품질")
+    # 눌림목: RSI 중앙(52) 가까울수록, 5MA이격 작을수록 우수
+    pullbacks.sort(key=lambda x: (
+        -abs((x["rsi"] or 52) - 52) - abs(x["ext_5ma"] or 0) * 2
+        + (2 if x["rs_ok"] else 0)
+    ), reverse=True)
 
-    print(f"\n{'='*78}")
-    print(f"  ☆ 모멘텀 적격 (주가/5MA {MIN_EXT_5MA_MOM}~{MAX_EXT_5MA_MOM}%, "
-          f"5-20MA≤{MAX_MA5_20_SPREAD}%, RSI {MOM_RSI_MIN}~{MOM_RSI_MAX}): {len(momentums)}개")
-    print("=" * 78)
-    for a in momentums:
-        print_stock_block(a, a["momentum_quality"], "모멘텀점수")
+    # 돌파: 고점 근접 + 거래량 높을수록 우수
+    breakouts.sort(key=lambda x: (
+        (x["from_high"] or -99) + (x["vol_ratio_5d"] or 0) * 5
+        + (2 if x["rs_ok"] else 0)
+    ), reverse=True)
 
-    # 4종목 매수 템플릿: 눌림목 2 + 모멘텀 2 (중복 제외)
-    pick_pb = pullbacks[:2]
-    pick_mom = [a for a in momentums if a["ticker"] not in {x["ticker"] for x in pick_pb}][:2]
-    print(f"\n{'='*78}")
-    print("  📋 매수 후보 (눌림목 2 + 모멘텀 2)")
-    print("=" * 78)
-    if pick_pb or pick_mom:
-        if pick_pb:
-            print("  [눌림목]")
-            for i, a in enumerate(pick_pb, 1):
-                print(f"    {i}. {a['name']} ({a['ticker']}) — "
-                      f"${fmt(a['price'])} | RSI {fmt(a['rsi'], nd=1)} | "
-                      f"5MA이격 {fmt(a['ext_5ma'], '%', 1)}")
-        if pick_mom:
-            print("  [모멘텀]")
-            for i, a in enumerate(pick_mom, 1):
-                print(f"    {i}. {a['name']} ({a['ticker']}) — "
-                      f"${fmt(a['price'])} | RSI {fmt(a['rsi'], nd=1)} | "
-                      f"5MA이격 {fmt(a['ext_5ma'], '%', 1)} | "
-                      f"거래량(5d) {fmt(a.get('vol_ratio_5d'), 'x', 2)}")
-        if len(pick_pb) < 2 or len(pick_mom) < 2:
-            print(f"  ⚠ 눌림목 {len(pick_pb)}/2 · 모멘텀 {len(pick_mom)}/2 — "
-                  "부족하면 다음 후보 또는 FOMC 이후 재실행.")
+    # 에너지응축: MA 간격 좁을수록, RS 있으면 우수
+    squeezes.sort(key=lambda x: (
+        -(abs(x["ext_5_20"] or 0) + abs(x["ext_20_50"] or 0))
+        + (2 if x["rs_ok"] else 0)
+    ), reverse=True)
+
+    # ── 섹션별 출력 ──
+    print(f"\n  ━━ 눌림목 후보 ({len(pullbacks)}개) ━━")
+    print(f"     조건: 상승추세 + 5MA±{PB_5MA_RANGE}% + RSI {PB_RSI_MIN}~{PB_RSI_MAX} + 거래량 수축")
+    if pullbacks:
+        for a in pullbacks:
+            _print_nasdaq_stock(a)
     else:
-        print("  ⚠ 적격 종목 없음 — 시장 레짐·이벤트 확인 후 재실행.")
+        print("  (해당 없음)")
 
-    print(f"\n{'='*78}")
-    print("  전체 요약 (눌림목·모멘텀 우선 → 점수순)")
-    print("=" * 78)
-    print(f"  {'종목':<18}{'티커':<7}{'현재가':>10}{'시총($B)':>9}{'RSI':>5}"
-          f"{'5MA이격':>8}{'점수':>6}{'적격/제외':>10}")
-    for a in results:
-        cap_str = f"{a['marketcap']:,.0f}" if a['marketcap'] else "N/A"
-        tag = exclusion_tag(a, market_ok)
+    print(f"\n  ━━ 돌파 후보 ({len(breakouts)}개) ━━")
+    print(f"     조건: 52주 고점 {BK_FROM_HIGH}% 이내 + RSI {BK_RSI_MIN}~{BK_RSI_MAX} + 거래량≥{BK_VOL_MIN}x")
+    if breakouts:
+        for a in breakouts:
+            _print_nasdaq_stock(a)
+    else:
+        print("  (해당 없음)")
+
+    print(f"\n  ━━ 에너지응축 후보 ({len(squeezes)}개) ━━")
+    print(f"     조건: 5-20MA≤{SQ_5_20_MAX}% + 20-50MA≤{SQ_20_50_MAX}% + 20일레인지≤{SQ_RANGE_MAX}%")
+    if squeezes:
+        for a in squeezes:
+            _print_nasdaq_stock(a)
+    else:
+        print("  (해당 없음)")
+
+    # QQQ 상대강도 Top 10
+    rs_ranked = sorted(
+        [a for a in results if a.get("ret_20d") is not None],
+        key=lambda x: x["ret_20d"], reverse=True
+    )[:10]
+    print(f"\n  ━━ QQQ 상대강도 Top 10 (20일 수익률 기준, QQQ {_f(bench,'%',1)}) ━━")
+    print(f"  {'종목':<18}{'티커':<7}{'현재가':>10}{'20일수익률':>10}{'RSI':>5}{'진입유형':>10}")
+    for a in rs_ranked:
+        et = a["entry_type"] or "-"
+        cap_flag = "" if a["cap_ok"] else " [시총↓]"
         print(f"  {a['name']:<16}{a['ticker']:<7}"
-              f"{fmt(a['price']):>10}{cap_str:>9}{fmt(a['rsi'], nd=0):>5}"
-              f"{fmt(a['ext_5ma'], '%', 1):>9}{a['score']:>3}/{len(a['checks'])}{tag:>10}")
+              f"{_f(a['price']):>10}"
+              f"{_f(a['ret_20d'],'%',1):>10}"
+              f"{_f(a['rsi'],nd=0):>5}"
+              f"{et:>10}{cap_flag}")
+
+    # 전체 테이블
+    print(f"\n  ━━ 전체 요약 ━━")
+    print(f"  {'종목':<18}{'티커':<7}{'현재가':>10}{'RSI':>5}{'5MA이격':>9}"
+          f"{'고점대비':>9}{'RS':>4}{'진입유형':>10}")
+    results_sorted = sorted(results, key=lambda x: (
+        0 if x["entry_type"] else 1,
+        x["entry_type"] or "z",
+        -(x["rs_score"])
+    ))
+    for a in results_sorted:
+        et = a["entry_type"] or _nd_tag(a)
+        rs = "▲" if a["rs_ok"] else "▼"
+        print(f"  {a['name']:<16}{a['ticker']:<7}"
+              f"{_f(a['price']):>10}"
+              f"{_f(a['rsi'],nd=0):>5}"
+              f"{_f(a['ext_5ma'],'%',1):>9}"
+              f"{_f(a['from_high'],'%',1):>9}"
+              f"{rs:>4}"
+              f"{et:>10}")
     print()
+
+
+def _nd_tag(a: dict) -> str:
+    if not a["cap_ok"]:
+        return "시총↓"
+    if not a["price_ok"]:
+        return "단가↑"
+    if not a["debt_ok"]:
+        return "부채↑"
+    if not a["above_50ma"]:
+        return "추세X"
+    if not a["regime_ok"]:
+        return "레짐↓"
+    r = a["rsi"]
+    if r is not None:
+        if r < PB_RSI_MIN:
+            return "RSI↓"
+        if r > BK_RSI_MAX:
+            return "RSI↑"
+    fh = a["from_high"]
+    if fh is not None and fh < BK_FROM_HIGH and fh < -15:
+        return "고점↓"
+    return "관찰"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  코스피 메인 루틴
+# ══════════════════════════════════════════════════════════════════════
+
+def run_kospi():
+    _sep()
+    print("  코스피 매수 후보발굴 스크리너")
+    print(f"  기준: 안전마진(PBR≤{KS_PBR_MAX}) · 실적모멘텀(목표가괴리율≥{KS_TGT_GAP*100:.0f}%)")
+    print(f"       수급전환(기관+외인 {KS_FLOW_DAYS}일 누적순매수>0 · 네이버) · 재무안정성(ROE≥{KS_ROE_MIN*100:.0f}%·부채≤{KS_DEBT_MAX}%)")
+    print(f"  점수: 가치(3) + 실적/성장(4) + 수급/기술(3) = 10점 | 우선후보≥7 관찰후보≥5")
+    _sep()
+
+    session, crumb = make_session()
+
+    regime = check_regime(KOSPI_INDEX)
+    flag   = "🟢 강세" if regime["ok"] else "🔴 약세"
+    bench  = regime["ret_20d"]
+    print(f"  [코스피 레짐] KOSPI {_f(regime['price'],nd=0)} / 50MA {_f(regime['ma50'],nd=0)} "
+          f"→ {regime['reason']}  {flag}  KOSPI 20일 {_f(bench,'%',1)}")
+    _sep()
+
+    print(f"  종목 {len(KOSPI_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
+    items = [(tick, name) for tick, name in KOSPI_CANDIDATES.items()]
+    results = _run_parallel(_kospi_worker, session, crumb, items, regime["ok"], bench)
+
+    priority  = [a for a in results if a["category"] == "우선 후보"]
+    watchlist = [a for a in results if a["category"] == "관찰 후보"]
+    others    = [a for a in results if a["category"] == "조건 미달"]
+
+    priority.sort(key=lambda x: x["score"], reverse=True)
+    watchlist.sort(key=lambda x: x["score"], reverse=True)
+
+    print(f"\n  ━━ 우선 후보 (점수 7+ / {len(priority)}개) ━━")
+    print("     실적모멘텀 + 안전마진 + 수급전환 동시 충족")
+    if priority:
+        for a in priority:
+            _print_kospi_stock(a)
+    else:
+        print("  (해당 없음)")
+
+    print(f"\n  ━━ 관찰 후보 (점수 5~6 / {len(watchlist)}개) ━━")
+    print("     일부 기준 충족 — 추가 확인 후 진입 검토")
+    if watchlist:
+        for a in watchlist:
+            _print_kospi_stock(a)
+    else:
+        print("  (해당 없음)")
+
+    print(f"\n  ━━ 코스피 레짐 상대강도 Top 10 ━━")
+    rs_ranked = sorted(
+        [a for a in results if a.get("ret_20d") is not None],
+        key=lambda x: x["ret_20d"], reverse=True
+    )[:10]
+    print(f"  {'종목':<14}{'티커':<14}{'현재가':>10}{'20일수익률':>10}{'RSI':>5}{'점수':>5}{'카테고리':>10}")
+    for a in rs_ranked:
+        price_s = f"{a['price']:,.0f}"
+        print(f"  {a['name']:<12}{a['ticker']:<14}"
+              f"{price_s:>10}"
+              f"{_f(a['ret_20d'],'%',1):>10}"
+              f"{_f(a['rsi'],nd=0):>5}"
+              f"{a['score']:>5}"
+              f"{a['category']:>10}")
+
+    print(f"\n  ━━ 전체 요약 ━━")
+    print(f"  {'종목':<12}{'티커':<14}{'현재가':>10}{'PBR':>6}{'PER':>6}{'RSI':>5}"
+          f"{'목표괴리':>8}{'점수':>5}{'카테고리':>10}")
+    all_sorted = sorted(results, key=lambda x: x["score"], reverse=True)
+    for a in all_sorted:
+        price_s  = f"{a['price']:,.0f}"
+        tgt_s    = f"+{a['tgt_gap']*100:.0f}%" if a.get("tgt_gap") else "N/A"
+        excl     = f"  ← {a['exclude_reason']}" if a.get("exclude_reason") else ""
+        print(f"  {a['name']:<10}{a['ticker']:<14}"
+              f"{price_s:>10}"
+              f"{_f(a['pbr'],nd=2):>6}"
+              f"{_f(a['per'],nd=1):>6}"
+              f"{_f(a['rsi'],nd=0):>5}"
+              f"{tgt_s:>8}"
+              f"{a['score']:>5}"
+              f"{a['category']:>10}{excl}")
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  진입점
+# ══════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="나스닥/코스피 매수 후보발굴 스크리너")
+    parser.add_argument("--kospi", action="store_true", help="코스피 모드로 실행")
+    args = parser.parse_args()
+
+    if args.kospi:
+        run_kospi()
+    else:
+        run_nasdaq()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
+import html
 import json
 import os
 import requests
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 
 # GitHub Actions 등 CI 환경에서는 ANSI 색상 비활성화
@@ -9,13 +10,17 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 
 # ─────────────────────────────────────────────
 # 보유 주식 설정 (종목명, 티커, 평단가, 수량, 매수일)
-# buy_date: 실제 매수일로 수정해주세요 (YYYY-MM-DD)
 # ─────────────────────────────────────────────
+# 청산 기준: 종목별 목표가·손절가로 관리 (고정 %룰 폐지)
+#   target_price : 업종 멀티플 × 예상 이익성장 기반 현실적 목표가
+#   stop_price   : 20일 ATR 고려, 추세가 꺾였다고 판단되는 손절 가격
+#                  (일시적 흔들림엔 견디되 지지선·주요 이평선 이탈 시 청산)
+# 추세가 진행되면 stop_price를 지지선 상향에 맞춰 올려 관리한다(트레일).
 PORTFOLIO = [
-    {"name": "크레도 테크놀로지",    "ticker": "CRDO", "avg_price": 256.5088, "qty": 17, "buy_date": "2026-07-07"},
-    {"name": "케이던스",          "ticker": "CDNS", "avg_price": 396.3280, "qty": 10, "buy_date": "2026-06-14"},
-    {"name": "하우멧 에어로스페이스", "ticker": "HWM",  "avg_price": 279.5975, "qty": 12, "buy_date": "2026-07-07"},
-    {"name": "마이크론",          "ticker": "MU",   "avg_price": 1047.2967, "qty": 3,  "buy_date": "2026-07-01"},
+    {"name": "케이던스",          "ticker": "CDNS", "avg_price": 396.3280,
+     "stop_price": 358.0, "target_price": 430.0, "qty": 10, "buy_date": "2026-06-14"},
+    {"name": "하우멧 에어로스페이스", "ticker": "HWM",  "avg_price": 279.5975,
+     "stop_price": 252.0, "target_price": 315.0, "qty": 12, "buy_date": "2026-07-07"},
 ]
 
 # 매도 알림에서 제외할 티커
@@ -63,67 +68,30 @@ def update_best_return(history: dict, ticker: str, current_rate: float) -> dict:
     return history
 
 
-def check_sell_alert(ticker: str, name: str, current_rate: float, history: dict) -> list[str]:
-    """손절 알림 조건 확인. 해당 항목 리스트 반환."""
-    if ticker in ALERT_EXCLUDE:
+def check_stop_alert(ticker: str, name: str, price: float,
+                     stop_price: float | None, current_rate: float) -> list[str]:
+    """손절 알림: 현재가가 종목별 손절가(추세 이탈 기준) 이하로 내려오면 알림."""
+    if ticker in ALERT_EXCLUDE or stop_price is None:
         return []
-
-    alerts = []
-
-    # 조건 1: 현재 수익률 -7% 이하 (기본 손절)
-    if current_rate <= -7.0:
-        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 기본 손절 기준(-7%) 도달")
-
-    # 조건 2: 역대 최고 수익률 대비 -10%p 이상 하락 (고점 대비 트레일링 스탑)
-    if ticker in history:
-        best      = history[ticker]["best_return"]
-        best_date = history[ticker]["best_date"]
-        if current_rate <= best - 10.0:
-            alerts.append(
-                f"[{name} / {ticker}]  "
-                f"최고 수익률 {fmt_rate(best)} ({best_date}) 대비 "
-                f"{fmt_rate(current_rate - best)} 하락 — 고점 대비 손절 기준 도달"
-            )
-
-    return alerts
-
-
-def check_time_stop_alert(ticker: str, name: str, buy_date_str: str, current_rate: float) -> list[str]:
-    """시간 손절 알림: 매수 후 21일(3주) 경과 & 수익률 +5% 미달 시 알림."""
-    if ticker in ALERT_EXCLUDE:
-        return []
-
-    try:
-        buy_date   = date.fromisoformat(buy_date_str)
-        today      = date.today()
-        held_days  = (today - buy_date).days
-    except ValueError:
-        return []
-
-    if held_days >= 21 and current_rate < 5.0:
+    if price <= stop_price:
         return [
-            f"[{name} / {ticker}]  "
-            f"매수 후 {held_days}일 경과, 수익률 {fmt_rate(current_rate)} — "
-            f"시간 손절 기준 도달 (3주 이상 보유 & +5% 미달)"
+            f"[{name} / {ticker}]  현재가 ${price:,.2f} ≤ 손절가 ${stop_price:,.2f} "
+            f"(수익률 {fmt_rate(current_rate)}) — 추세 이탈, 손절 실행"
         ]
     return []
 
 
-def check_profit_alert(ticker: str, name: str, current_rate: float) -> list[str]:
-    """익절 알림 조건 확인. 해당 항목 리스트 반환."""
-    if ticker in ALERT_EXCLUDE:
+def check_target_alert(ticker: str, name: str, price: float,
+                       target_price: float | None, current_rate: float) -> list[str]:
+    """목표가 알림: 현재가가 종목별 목표가(밸류에이션 기반) 이상이면 청산 검토."""
+    if ticker in ALERT_EXCLUDE or target_price is None:
         return []
-
-    alerts = []
-
-    # 조건 1: 수익률 +30% 이상 → 전량 익절
-    if current_rate >= 30.0:
-        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 전량 익절 목표 도달 (+30%)")
-    # 조건 2: 수익률 +20% 이상 → 절반 익절
-    elif current_rate >= 20.0:
-        alerts.append(f"[{name} / {ticker}]  수익률 {fmt_rate(current_rate)} — 절반 익절 목표 도달 (+20%)")
-
-    return alerts
+    if price >= target_price:
+        return [
+            f"[{name} / {ticker}]  현재가 ${price:,.2f} ≥ 목표가 ${target_price:,.2f} "
+            f"(수익률 {fmt_rate(current_rate)}) — 목표가 도달, 청산 검토"
+        ]
+    return []
 
 
 # ── 포맷 헬퍼 ─────────────────────────────────
@@ -157,104 +125,12 @@ def yellow(text: str) -> str:
     return text if IS_CI else f"\033[93m{text}\033[0m"
 
 
-# ── 마크다운 저장 ──────────────────────────────
+# ── 스냅샷 계산 ────────────────────────────────
 
-def save_markdown(results: list, total_cost: float, total_value: float,
-                  krw_rate: float, sell_alerts: list[str], profit_alerts: list[str]):
-    now       = datetime.now()
-    date_str  = now.strftime("%Y-%m-%d")
-    time_str  = now.strftime("%H:%M")
-    month_dir = f"{now.month}월"
-    filename  = f"포트폴리오_{date_str}.md"
-
-    month_path = BASE_DIR / "매매리포트" / month_dir
-    month_path.mkdir(parents=True, exist_ok=True)
-    save_path = month_path / filename
-
-    total_profit = total_value - total_cost
-    total_rate   = (total_profit / total_cost) * 100
-
-    lines = []
-    lines.append("# 나스닥 포트폴리오 수익률 현황")
-    lines.append("")
-    lines.append(f"> 기준일시: {date_str} {time_str} | 적용 환율: 1 USD = {krw_rate:,.0f}원")
-    lines.append("")
-
-    # 손절 알림 섹션
-    if sell_alerts:
-        lines.append("---")
-        lines.append("")
-        lines.append("## 🚨 손절 권장 알림")
-        lines.append("")
-        for alert in sell_alerts:
-            lines.append(f"> 🔴 **{alert}**")
-        lines.append("")
-
-    # 익절 알림 섹션
-    if profit_alerts:
-        lines.append("---")
-        lines.append("")
-        lines.append("## 💰 익절 권장 알림")
-        lines.append("")
-        for alert in profit_alerts:
-            lines.append(f"> 🟢 **{alert}**")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    lines.append("## 보유 종목별 현황")
-    lines.append("")
-    lines.append("| 종목 | 티커 | 평단가 ($) | 현재가 ($) | 손익 ($) | 손익 (₩) | 수익률 | 최고수익률 | 고점대비 |")
-    lines.append("|------|------|----------:|----------:|---------:|---------:|-------:|-----------:|---------:|")
-
-    for name, tick, avg, price, qty, cost, value, profit, rate, best_return in results:
-        p_str    = f"+${profit:,.2f}"          if profit >= 0 else f"-${abs(profit):,.2f}"
-        pk_str   = f"+₩{profit*krw_rate:,.0f}" if profit >= 0 else f"-₩{abs(profit*krw_rate):,.0f}"
-        r_str    = fmt_rate(rate)
-        b_str    = fmt_rate(best_return)
-        diff     = rate - best_return
-        diff_str = fmt_rate(diff)
-        lines.append(
-            f"| {name} | {tick} | ${avg:,.2f} | ${price:,.2f} "
-            f"| {p_str} | {pk_str} | {r_str} | {b_str} | {diff_str} |"
-        )
-
-    tp_str  = f"+${total_profit:,.2f}"          if total_profit >= 0 else f"-${abs(total_profit):,.2f}"
-    tpk_str = f"+₩{total_profit*krw_rate:,.0f}" if total_profit >= 0 else f"-₩{total_profit*krw_rate:,.0f}"
-    tr_str  = fmt_rate(total_rate)
-    lines.append(f"| **합계** | | | | **{tp_str}** | **{tpk_str}** | **{tr_str}** | | |")
-
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## 원화 환산 요약")
-    lines.append("")
-    lines.append("| 항목 | 금액 |")
-    lines.append("|------|-----:|")
-    lines.append(f"| 총 매수금액 | ₩{total_cost * krw_rate:,.0f} |")
-    lines.append(f"| 총 평가금액 | ₩{total_value * krw_rate:,.0f} |")
-    lines.append(f"| 총 손익 | {tpk_str} |")
-    lines.append(f"| 총 수익률 | {tr_str} |")
-    lines.append("")
-
-    save_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"\n  💾 저장 완료: 매매리포트/{month_dir}/{filename}")
-
-
-# ── 메인 출력 ──────────────────────────────────
-
-def print_portfolio():
+def build_portfolio_snapshot() -> dict:
+    """보유 종목 가격·손익·알림을 한 번 계산해 콘솔/텔레그램이 공유한다."""
     krw_rate = get_exchange_rate()
     history  = load_history()
-
-    col_w = [16, 6, 10, 10, 12, 14, 9, 11, 9]
-    header = (
-        f"  {'종목':<{col_w[0]}} {'티커':<{col_w[1]}} "
-        f"{'평단가($)':>{col_w[2]}} {'현재가($)':>{col_w[3]}} "
-        f"{'손익($)':>{col_w[4]}} {'손익(₩)':>{col_w[5]}} {'수익률':>{col_w[6]}} "
-        f"{'최고수익률':>{col_w[7]}} {'고점대비':>{col_w[8]}}"
-    )
-    sep = "  " + "─" * (sum(col_w) + len(col_w) + 4)
 
     total_cost    = 0.0
     total_value   = 0.0
@@ -262,7 +138,6 @@ def print_portfolio():
     sell_alerts   = []
     profit_alerts = []
 
-    # 각 종목 계산
     for stock in PORTFOLIO:
         name  = stock["name"]
         tick  = stock["ticker"]
@@ -273,47 +148,83 @@ def print_portfolio():
         if price is None:
             continue
 
-        cost       = avg * qty
-        value      = price * qty
-        profit     = value - cost
-        profit_krw = profit * krw_rate
-        rate       = (price - avg) / avg * 100
+        cost   = avg * qty
+        value  = price * qty
+        profit = value - cost
+        rate   = (price - avg) / avg * 100
 
         history     = update_best_return(history, tick, rate)
         best_return = history[tick]["best_return"]
 
-        sell_alerts   += check_sell_alert(tick, name, rate, history)
-        sell_alerts   += check_time_stop_alert(tick, name, stock.get("buy_date", ""), rate)
-        profit_alerts += check_profit_alert(tick, name, rate)
+        target = stock.get("target_price")
+        stop   = stock.get("stop_price")
+        sell_alerts   += check_stop_alert(tick, name, price, stop, rate)
+        profit_alerts += check_target_alert(tick, name, price, target, rate)
 
         total_cost  += cost
         total_value += value
-        results.append((name, tick, avg, price, qty, cost, value, profit, rate, best_return))
+        results.append({
+            "name": name, "ticker": tick, "avg": avg, "price": price,
+            "qty": qty, "cost": cost, "value": value, "profit": profit,
+            "rate": rate, "best_return": best_return,
+            "target": target, "stop": stop,
+        })
 
     save_history(history)
 
-    # ── 출력 시작 ──
+    total_profit = total_value - total_cost
+    total_rate   = (total_profit / total_cost * 100) if total_cost else 0.0
+
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "krw_rate": krw_rate,
+        "results": results,
+        "sell_alerts": sell_alerts,
+        "profit_alerts": profit_alerts,
+        "total_cost": total_cost,
+        "total_value": total_value,
+        "total_profit": total_profit,
+        "total_rate": total_rate,
+    }
+
+
+# ── 콘솔 출력 ──────────────────────────────────
+
+def print_portfolio(snap: dict | None = None):
+    snap = snap or build_portfolio_snapshot()
+    krw_rate = snap["krw_rate"]
+    results  = snap["results"]
+    sell_alerts   = snap["sell_alerts"]
+    profit_alerts = snap["profit_alerts"]
+
+    col_w = [16, 6, 10, 8, 8, 10, 12, 14, 9, 11, 9]
+    header = (
+        f"  {'종목':<{col_w[0]}} {'티커':<{col_w[1]}} "
+        f"{'평단가($)':>{col_w[2]}} {'손절가':>{col_w[3]}} {'목표가':>{col_w[4]}} "
+        f"{'현재가($)':>{col_w[5]}} {'손익($)':>{col_w[6]}} {'손익(₩)':>{col_w[7]}} "
+        f"{'수익률':>{col_w[8]}} {'최고수익률':>{col_w[9]}} {'고점대비':>{col_w[10]}}"
+    )
+    sep = "  " + "─" * (sum(col_w) + len(col_w) + 4)
+
     print()
     print("  ════════════════════════════════════════════════════════")
     print("           📊  나스닥 포트폴리오 수익률 현황")
     print("  ════════════════════════════════════════════════════════")
     print(f"  적용 환율: 1 USD = {krw_rate:,.0f}원")
 
-    # 손절 알림 (최상단 출력)
     if sell_alerts:
         print()
         print("  ┌─────────────────────────────────────────────────────┐")
-        print("  │                🚨  손절 권장 알림                    │")
+        print("  │              🚨  손절가 도달 알림                    │")
         print("  ├─────────────────────────────────────────────────────┤")
         for alert in sell_alerts:
             print(f"  │  🔴 {yellow(alert):<60}│")
         print("  └─────────────────────────────────────────────────────┘")
 
-    # 익절 알림 (손절 알림 바로 아래)
     if profit_alerts:
         print()
         print("  ┌─────────────────────────────────────────────────────┐")
-        print("  │                💰  익절 권장 알림                    │")
+        print("  │              💰  목표가 도달 알림                    │")
         print("  ├─────────────────────────────────────────────────────┤")
         for alert in profit_alerts:
             print(f"  │  🟢 {alert:<60}│")
@@ -323,50 +234,161 @@ def print_portfolio():
     print(header)
     print(sep)
 
-    for name, tick, avg, price, qty, cost, value, profit, rate, best_return in results:
-        profit_krw     = profit * krw_rate
-        rate_str       = color(fmt_rate(rate), rate)
-        profit_str     = color(fmt_usd(profit), profit)
+    for r in results:
+        profit_krw     = r["profit"] * krw_rate
+        rate_str       = color(fmt_rate(r["rate"]), r["rate"])
+        profit_str     = color(fmt_usd(r["profit"]), r["profit"])
         profit_krw_str = color(("+") + fmt_krw(profit_krw) if profit_krw >= 0 else fmt_krw(profit_krw), profit_krw)
-        diff           = rate - best_return
-        best_str       = fmt_rate(best_return)
+        diff           = r["rate"] - r["best_return"]
+        best_str       = fmt_rate(r["best_return"])
         diff_str       = color(fmt_rate(diff), diff)
+        stop_str       = f"${r['stop']:,.0f}" if r["stop"] else "-"
+        target_str     = f"${r['target']:,.0f}" if r["target"] else "-"
         print(
-            f"  {name:<{col_w[0]}} {tick:<{col_w[1]}} "
-            f"{fmt_usd_plain(avg):>{col_w[2]}} {fmt_usd_plain(price):>{col_w[3]}} "
-            f"{profit_str:>{col_w[4]+9}} {profit_krw_str:>{col_w[5]+9}} {rate_str:>{col_w[6]+9}} "
-            f"{best_str:>{col_w[7]}} {diff_str:>{col_w[8]+9}}"
+            f"  {r['name']:<{col_w[0]}} {r['ticker']:<{col_w[1]}} "
+            f"{fmt_usd_plain(r['avg']):>{col_w[2]}} {stop_str:>{col_w[3]}} {target_str:>{col_w[4]}} "
+            f"{fmt_usd_plain(r['price']):>{col_w[5]}} {profit_str:>{col_w[6]+9}} "
+            f"{profit_krw_str:>{col_w[7]+9}} {rate_str:>{col_w[8]+9}} "
+            f"{best_str:>{col_w[9]}} {diff_str:>{col_w[10]+9}}"
         )
 
     if not results:
         print("  가격 조회에 실패했습니다. 인터넷 연결을 확인하세요.")
         return
 
-    total_profit     = total_value - total_cost
+    total_profit     = snap["total_profit"]
     total_profit_krw = total_profit * krw_rate
-    total_rate       = (total_profit / total_cost) * 100
+    total_rate       = snap["total_rate"]
 
     print(sep)
     print(
         f"  {'합계':<{col_w[0]}} {'':<{col_w[1]}} "
-        f"{'':{col_w[2]}} {'':{col_w[3]}} "
-        f"{color(fmt_usd(total_profit), total_profit):>{col_w[4]+9}} "
-        f"{color(('+' if total_profit_krw >= 0 else '') + fmt_krw(total_profit_krw), total_profit_krw):>{col_w[5]+9}} "
-        f"{color(fmt_rate(total_rate), total_rate):>{col_w[6]+9}} "
-        f"{'':{col_w[7]}} {'':{col_w[8]}}"
+        f"{'':{col_w[2]}} {'':{col_w[3]}} {'':{col_w[4]}} {'':{col_w[5]}} "
+        f"{color(fmt_usd(total_profit), total_profit):>{col_w[6]+9}} "
+        f"{color(('+' if total_profit_krw >= 0 else '') + fmt_krw(total_profit_krw), total_profit_krw):>{col_w[7]+9}} "
+        f"{color(fmt_rate(total_rate), total_rate):>{col_w[8]+9}} "
+        f"{'':{col_w[9]}} {'':{col_w[10]}}"
     )
 
     print()
-    print("  ┌─── 원화 환산 요약 ──────────────────────────────────┐")
-    print(f"  │  총 매수금액 : {fmt_krw(total_cost * krw_rate):<38}│")
-    print(f"  │  총 평가금액 : {fmt_krw(total_value * krw_rate):<38}│")
-    print(f"  │  총 손익     : {color(('+' if total_profit>=0 else '') + fmt_krw(total_profit * krw_rate), total_profit):<47}│")
-    print(f"  │  총 수익률   : {color(fmt_rate(total_rate), total_rate):<47}│")
+    print("  ┌─── 청산 기준 (목표가·손절가) ───────────────────────┐")
+    print(f"  │  {'종목':<14}{'현재가':>9}{'손절가':>9}{'목표가':>9}{'손절까지':>9}{'목표까지':>9} │")
+    for r in results:
+        stop_s   = f"${r['stop']:,.0f}" if r["stop"] else "-"
+        tgt_s    = f"${r['target']:,.0f}" if r["target"] else "-"
+        to_stop  = f"{(r['stop']/r['price']-1)*100:+.1f}%" if r["stop"] else "-"
+        to_tgt   = f"{(r['target']/r['price']-1)*100:+.1f}%" if r["target"] else "-"
+        print(f"  │  {r['name']:<13}{fmt_usd_plain(r['price']):>9}{stop_s:>9}{tgt_s:>9}"
+              f"{to_stop:>9}{to_tgt:>9} │")
     print("  └─────────────────────────────────────────────────────┘")
 
-    save_markdown(results, total_cost, total_value, krw_rate, sell_alerts, profit_alerts)
+    print()
+    print("  ┌─── 원화 환산 요약 ──────────────────────────────────┐")
+    print(f"  │  총 매수금액 : {fmt_krw(snap['total_cost'] * krw_rate):<38}│")
+    print(f"  │  총 평가금액 : {fmt_krw(snap['total_value'] * krw_rate):<38}│")
+    print(f"  │  총 손익     : {color(('+' if total_profit>=0 else '') + fmt_krw(total_profit_krw), total_profit):<47}│")
+    print(f"  │  총 수익률   : {color(fmt_rate(total_rate), total_rate):<47}│")
+    print("  └─────────────────────────────────────────────────────┘")
     print()
 
 
+# ── 텔레그램 ──────────────────────────────────
+
+def build_telegram_summary(snap: dict) -> str:
+    """텔레그램용 HTML 요약 (길이 ≤ 4096)."""
+    krw = snap["krw_rate"]
+    lines = [
+        f"<b>📊 나스닥 일일 리포트</b> ({html.escape(snap['date'])})",
+        f"환율 1 USD = {krw:,.0f}원",
+        "",
+    ]
+
+    if snap["sell_alerts"]:
+        lines.append("<b>🚨 손절가 도달</b>")
+        for a in snap["sell_alerts"]:
+            lines.append(f"🔴 {html.escape(a)}")
+        lines.append("")
+
+    if snap["profit_alerts"]:
+        lines.append("<b>💰 목표가 도달</b>")
+        for a in snap["profit_alerts"]:
+            lines.append(f"🟢 {html.escape(a)}")
+        lines.append("")
+
+    if not snap["results"]:
+        lines.append("가격 조회 실패 — 재실행 필요")
+        return "\n".join(lines)
+
+    lines.append("<b>보유 종목</b>")
+    for r in snap["results"]:
+        name = html.escape(r["name"])
+        tick = html.escape(r["ticker"])
+        stop_s = f"${r['stop']:,.0f}" if r["stop"] else "-"
+        tgt_s  = f"${r['target']:,.0f}" if r["target"] else "-"
+        to_stop = f"{(r['stop']/r['price']-1)*100:+.1f}%" if r["stop"] else "-"
+        to_tgt  = f"{(r['target']/r['price']-1)*100:+.1f}%" if r["target"] else "-"
+        lines.append(
+            f"• <b>{name}</b> ({tick})  {fmt_usd_plain(r['price'])}  "
+            f"{fmt_rate(r['rate'])}\n"
+            f"  손익 {fmt_usd(r['profit'])} / {fmt_krw(r['profit'] * krw)}\n"
+            f"  손절 {stop_s} ({to_stop}) · 목표 {tgt_s} ({to_tgt})"
+        )
+
+    total_profit_krw = snap["total_profit"] * krw
+    profit_sign = "+" if snap["total_profit"] >= 0 else ""
+    lines += [
+        "",
+        "<b>합계</b>",
+        f"평가 {fmt_krw(snap['total_value'] * krw)}  "
+        f"손익 {profit_sign}{fmt_krw(total_profit_krw)}  "
+        f"({fmt_rate(snap['total_rate'])})",
+    ]
+    return "\n".join(lines)
+
+
+def send_telegram(text: str) -> bool:
+    """TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 있으면 전송.
+    없거나 실패하면 False (로컬 실행은 secrets 없이 통과).
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("  [텔레그램] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — 전송 생략")
+        return False
+
+    # 텔레그램 메시지 길이 한도
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+
+    try:
+        res = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+        data = res.json()
+        if not data.get("ok"):
+            print(f"  [텔레그램] 전송 실패: {data}")
+            return False
+        print("  [텔레그램] 일일 리포트 전송 완료")
+        return True
+    except Exception as e:
+        print(f"  [텔레그램] 전송 오류: {e}")
+        return False
+
+
+def main():
+    snap = build_portfolio_snapshot()
+    print_portfolio(snap)
+    msg = build_telegram_summary(snap)
+    # CI에서는 secrets가 있을 때만 전송. 로컬도 env 설정 시 전송됨.
+    send_telegram(msg)
+
+
 if __name__ == "__main__":
-    print_portfolio()
+    main()
