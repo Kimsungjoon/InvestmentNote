@@ -2,16 +2,25 @@ name: 포트폴리오 자동 업데이트
 
 on:
   schedule:
-    # 미국 동부 장 마감(오후 4시) 기준
-    # EDT (3월~11월): 20:00 UTC = 익일 05:00 KST
-    # EST (11월~3월): 21:00 UTC = 익일 06:00 KST
-    # 두 시즌 모두 커버하도록 21:05 UTC에 실행
+    # 장중 손절/목표가 점검 — 30분마다 (미국 정규장 커버)
+    # EDT: 14:30~20:00 UTC / EST: 15:30~21:00 UTC → 14~20시 대역으로 양쪽 커버
+    - cron: '*/30 14-20 * * 1-5'
+    # 장 마감 일일 리포트
+    # EDT 20:00 / EST 21:00 UTC 마감 → 21:05 UTC
     - cron: '5 21 * * 1-5'
 
-  # 수동 실행 버튼 활성화 (GitHub Actions 탭에서 직접 실행 가능)
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - alerts
+          - test
 
-# 레포 쓰기 권한 부여 (파일 커밋 & 푸시에 필요)
 permissions:
   contents: write
 
@@ -33,13 +42,34 @@ jobs:
       - name: 의존성 설치
         run: pip install requests
 
-      - name: 포트폴리오 스크립트 실행 + 텔레그램 리포트
+      - name: 모드 결정 후 실행
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python portfolio.py
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -e
+          MODE="${INPUT_MODE:-}"
+          if [ -z "$MODE" ]; then
+            # schedule: 21시 UTC → 일일 리포트, 그 외 → 알림 전용
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "21" ]; then
+              MODE=daily
+            else
+              MODE=alerts
+            fi
+          fi
+          echo "실행 모드: $MODE (UTC $(date -u +%H:%M))"
+          if [ "$MODE" = "test" ]; then
+            python portfolio.py --test-notify
+          elif [ "$MODE" = "alerts" ]; then
+            python portfolio.py --alerts-only
+          else
+            python portfolio.py
+          fi
 
       - name: 결과 파일 커밋 & 푸시
+        if: ${{ github.event.inputs.mode != 'test' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

@@ -1,3 +1,4 @@
+import argparse
 import html
 import json
 import os
@@ -43,9 +44,166 @@ def get_price(ticker: str) -> float | None:
         return None
 
 
+def get_bars(ticker: str, range_: str = "3mo") -> dict | None:
+    """일봉 close/volume + 현재가."""
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?interval=1d&range={range_}")
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        result = res.json()["chart"]["result"][0]
+        meta = result["meta"]
+        q = result["indicators"]["quote"][0]
+        closes = [c for c in q["close"] if c is not None]
+        vols   = [v for v in q["volume"] if v is not None]
+        price  = meta.get("regularMarketPrice") or (closes[-1] if closes else None)
+        if price is None or len(closes) < 25:
+            return None
+        return {
+            "price": round(float(price), 2),
+            "close": closes,
+            "volume": vols,
+        }
+    except Exception:
+        return None
+
+
+def _sma(values: list[float], window: int) -> float | None:
+    if len(values) < window:
+        return None
+    return sum(values[-window:]) / window
+
+
+def _ret_nd(closes: list[float], n: int = 20) -> float | None:
+    if len(closes) < n + 1:
+        return None
+    return (closes[-1] / closes[-(n + 1)] - 1) * 100
+
+
 def get_exchange_rate() -> float:
     price = get_price("USDKRW=X")
     return round(price, 0) if price else 1484.0
+
+
+# 보유 흐름 분류 (나스닥_보유매도판단_프롬프트 §2 요약)
+FLOW_SELL     = "매도 우선"
+FLOW_REDUCE   = "비중 축소"
+FLOW_REVIEW   = "보유 재검토"
+FLOW_HOLD     = "상승 여지 유지"
+
+
+def classify_hold_flow(r: dict, bars: dict | None, qqq_ret: float | None) -> dict:
+    """목표가·추세·RS·거래량·20MA로 4단계 분류 + 한 줄 대응.
+
+    섹터 역할·매수 논리(프롬프트 6·7)는 자동화 불가 → 사유에 미포함.
+    """
+    price  = r["price"]
+    stop   = r.get("stop")
+    target = r.get("target")
+    to_tgt  = ((target / price) - 1) * 100 if target and price else None
+    to_stop = ((stop / price) - 1) * 100 if stop and price else None
+
+    ma20 = ma50 = ret20 = vol_ratio = None
+    above_20 = above_50 = None
+    if bars:
+        closes, vols = bars["close"], bars["volume"]
+        ma20 = _sma(closes, 20)
+        ma50 = _sma(closes, 50)
+        ret20 = _ret_nd(closes, 20)
+        if ma20 is not None:
+            above_20 = price > ma20
+        if ma50 is not None:
+            above_50 = price > ma50
+        if len(vols) >= 20:
+            avg20 = sum(vols[-20:]) / 20
+            avg5  = sum(vols[-5:]) / 5 if len(vols) >= 5 else None
+            vol_ratio = (avg5 / avg20) if (avg5 and avg20) else None
+
+    rs_ok = (ret20 is not None and qqq_ret is not None and ret20 > qqq_ret)
+    reasons = []
+
+    # ── 우선순위: 매도 우선 > 비중 축소 > 보유 재검토 > 상승 여지 유지 ──
+    if stop is not None and price <= stop:
+        return {
+            "flow": FLOW_SELL,
+            "action": f"손절가 도달 → 전량 청산 검토 (손절 ${stop:,.0f})",
+            "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+        }
+
+    if to_stop is not None and to_stop > -3 and above_20 is False and above_50 is False:
+        reasons = ["손절 임박", "20/50MA 이탈"]
+        if rs_ok is False:
+            reasons.append("RS약세")
+        return {
+            "flow": FLOW_SELL,
+            "action": " · ".join(reasons) + " → 손절 준비·비중 축소 우선",
+            "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+        }
+
+    if target is not None and price >= target:
+        return {
+            "flow": FLOW_REDUCE,
+            "action": f"목표가 도달 → 청산·익절 검토 (목표 ${target:,.0f})",
+            "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+        }
+
+    if to_tgt is not None and 0 < to_tgt <= 5:
+        return {
+            "flow": FLOW_REDUCE,
+            "action": f"목표가 {to_tgt:+.1f}% 이내 → 분할 익절·비중 축소 검토",
+            "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+        }
+
+    weak = []
+    if above_20 is False:
+        weak.append("20MA↓")
+    if rs_ok is False and ret20 is not None and qqq_ret is not None:
+        weak.append("QQQ대비 열위")
+    if to_stop is not None and -5 <= to_stop < 0:
+        weak.append(f"손절까지 {to_stop:+.1f}%")
+    if vol_ratio is not None and vol_ratio >= 1.3 and (r["rate"] < 0):
+        weak.append("하락+거래량↑")
+
+    if weak:
+        return {
+            "flow": FLOW_REVIEW,
+            "action": " · ".join(weak) + " → 손절·비중·논리 재확인",
+            "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+        }
+
+    upside = f"목표 {to_tgt:+.1f}%" if to_tgt is not None else "목표가 N/A"
+    if above_20 is True:
+        trend = "20MA↑"
+    elif above_20 is False:
+        trend = "20MA↓"
+    else:
+        trend = "추세 N/A"
+    if rs_ok is True:
+        rs = "RS▲"
+    elif rs_ok is False:
+        rs = "RS·"
+    else:
+        rs = "RS N/A"
+
+    return {
+        "flow": FLOW_HOLD,
+        "action": f"{trend} · {rs} · {upside} → 보유 유지·손절가만 관리",
+        "to_target": to_tgt, "rs_ok": rs_ok, "above_20": above_20,
+    }
+
+
+def attach_flow_classifications(results: list[dict]) -> float | None:
+    """QQQ 대비 RS와 종목별 흐름 분류를 results에 붙인다. QQQ 20일 수익률 반환."""
+    qqq = get_bars("QQQ")
+    qqq_ret = _ret_nd(qqq["close"], 20) if qqq else None
+    for r in results:
+        bars = get_bars(r["ticker"])
+        flow = classify_hold_flow(r, bars, qqq_ret)
+        r["flow"] = flow["flow"]
+        r["flow_action"] = flow["action"]
+        r["above_20"] = flow["above_20"]
+        r["rs_ok"] = flow["rs_ok"]
+        r["to_target_pct"] = flow["to_target"]
+    return qqq_ret
 
 
 # ── 최고 수익률 기록 관리 ──────────────────────
@@ -61,10 +219,16 @@ def save_history(history: dict):
 
 
 def update_best_return(history: dict, ticker: str, current_rate: float) -> dict:
-    """현재 수익률이 역대 최고치면 갱신."""
+    """현재 수익률이 역대 최고치면 갱신. 다른 키(_sent_alerts 등)는 유지."""
     today = datetime.now().strftime("%Y-%m-%d")
-    if ticker not in history or current_rate > history[ticker]["best_return"]:
-        history[ticker] = {"best_return": round(current_rate, 2), "best_date": today}
+    entry = history.get(ticker)
+    if not isinstance(entry, dict):
+        entry = {}
+        history[ticker] = entry
+    best = entry.get("best_return")
+    if best is None or current_rate > best:
+        entry["best_return"] = round(current_rate, 2)
+        entry["best_date"] = today
     return history
 
 
@@ -92,6 +256,71 @@ def check_target_alert(ticker: str, name: str, price: float,
             f"(수익률 {fmt_rate(current_rate)}) — 목표가 도달, 청산 검토"
         ]
     return []
+
+
+def _alert_key(ticker: str, kind: str, level: float) -> str:
+    return f"{ticker}:{kind}:{level:.4f}"
+
+
+def _ensure_sent_alerts(history: dict) -> dict:
+    sent = history.get("_sent_alerts")
+    if not isinstance(sent, dict):
+        sent = {}
+        history["_sent_alerts"] = sent
+    return sent
+
+
+def collect_pending_alerts(history: dict, results: list[dict]) -> list[dict]:
+    """손절/목표가 도달 중이며 아직 전송하지 않은 알림 목록.
+
+    회복(손절 위·목표 아래)되면 전송 기록을 지워 재도달 시 다시 알림한다.
+    전송 성공 후에만 mark_alerts_sent()로 기록한다.
+    """
+    sent = _ensure_sent_alerts(history)
+    held = {r["ticker"] for r in results}
+    active_keys = set()
+    pending = []
+
+    for r in results:
+        tick = r["ticker"]
+        if tick in ALERT_EXCLUDE:
+            continue
+        name, price, rate = r["name"], r["price"], r["rate"]
+        stop, target = r.get("stop"), r.get("target")
+
+        if stop is not None and price <= stop:
+            key = _alert_key(tick, "stop", stop)
+            active_keys.add(key)
+            if key not in sent:
+                pending.append({
+                    "kind": "stop", "ticker": tick, "name": name,
+                    "price": price, "level": stop, "rate": rate, "key": key,
+                })
+
+        if target is not None and price >= target:
+            key = _alert_key(tick, "target", target)
+            active_keys.add(key)
+            if key not in sent:
+                pending.append({
+                    "kind": "target", "ticker": tick, "name": name,
+                    "price": price, "level": target, "rate": rate, "key": key,
+                })
+
+    for key in list(sent.keys()):
+        if key in active_keys:
+            continue
+        parts = key.split(":")
+        if len(parts) >= 2 and parts[0] in held:
+            del sent[key]
+
+    return pending
+
+
+def mark_alerts_sent(history: dict, alerts: list[dict]):
+    sent = _ensure_sent_alerts(history)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for a in alerts:
+        sent[a["key"]] = now
 
 
 # ── 포맷 헬퍼 ─────────────────────────────────
@@ -127,8 +356,11 @@ def yellow(text: str) -> str:
 
 # ── 스냅샷 계산 ────────────────────────────────
 
-def build_portfolio_snapshot() -> dict:
-    """보유 종목 가격·손익·알림을 한 번 계산해 콘솔/텔레그램이 공유한다."""
+def build_portfolio_snapshot(with_flow: bool = True) -> dict:
+    """보유 종목 가격·손익·알림을 한 번 계산해 콘솔/텔레그램이 공유한다.
+
+    with_flow=False 이면 장중 알림 전용(흐름 분류·일봉 추가조회 생략).
+    """
     krw_rate = get_exchange_rate()
     history  = load_history()
 
@@ -170,7 +402,10 @@ def build_portfolio_snapshot() -> dict:
             "target": target, "stop": stop,
         })
 
-    save_history(history)
+    new_alerts = collect_pending_alerts(history, results)
+    save_history(history)  # best_return·회복된 알림키 정리 반영
+
+    qqq_ret = attach_flow_classifications(results) if with_flow else None
 
     total_profit = total_value - total_cost
     total_rate   = (total_profit / total_cost * 100) if total_cost else 0.0
@@ -181,6 +416,8 @@ def build_portfolio_snapshot() -> dict:
         "results": results,
         "sell_alerts": sell_alerts,
         "profit_alerts": profit_alerts,
+        "new_alerts": new_alerts,
+        "qqq_ret_20d": qqq_ret,
         "total_cost": total_cost,
         "total_value": total_value,
         "total_profit": total_profit,
@@ -289,7 +526,59 @@ def print_portfolio(snap: dict | None = None):
     print(f"  │  총 손익     : {color(('+' if total_profit>=0 else '') + fmt_krw(total_profit_krw), total_profit):<47}│")
     print(f"  │  총 수익률   : {color(fmt_rate(total_rate), total_rate):<47}│")
     print("  └─────────────────────────────────────────────────────┘")
+
+    if any(r.get("flow") for r in results):
+        print()
+        print("  ┌─── 보유 흐름 분류 (자동요약) ───────────────────────┐")
+        qqq_s = fmt_rate(snap["qqq_ret_20d"]) if snap.get("qqq_ret_20d") is not None else "N/A"
+        print(f"  │  QQQ 20일 {qqq_s}")
+        for r in results:
+            flow = r.get("flow") or "-"
+            action = r.get("flow_action") or ""
+            print(f"  │  [{flow}] {r['name']} ({r['ticker']})")
+            print(f"  │    → {action}")
+        print("  │  ※ 섹터·매수논리는 프롬프트/HTS로 별도 확인")
+        print("  └─────────────────────────────────────────────────────┘")
     print()
+
+
+FLOW_EMOJI = {
+    FLOW_HOLD:   "✅",
+    FLOW_REVIEW: "⬜",
+    FLOW_REDUCE: "🟠",
+    FLOW_SELL:   "🔴",
+}
+
+
+def build_flow_telegram_section(snap: dict) -> list[str]:
+    """보유매도판단 프롬프트 §2 자동요약 블록."""
+    lines = [
+        "",
+        "<b>🧭 보유 흐름 분류</b>",
+        "<i>상승여지유지 / 보유재검토 / 비중축소 / 매도우선</i>",
+    ]
+    qqq = snap.get("qqq_ret_20d")
+    if qqq is not None:
+        lines.append(f"QQQ 20일 {fmt_rate(qqq)}")
+    lines.append("")
+
+    order = {FLOW_SELL: 0, FLOW_REDUCE: 1, FLOW_REVIEW: 2, FLOW_HOLD: 3}
+    ranked = sorted(
+        snap["results"],
+        key=lambda x: (order.get(x.get("flow"), 9), x.get("ticker") or ""),
+    )
+    for r in ranked:
+        flow = r.get("flow") or "-"
+        emoji = FLOW_EMOJI.get(flow, "•")
+        name = html.escape(r["name"])
+        tick = html.escape(r["ticker"])
+        action = html.escape(r.get("flow_action") or "")
+        lines.append(f"{emoji} <b>{flow}</b> — {name} ({tick})")
+        lines.append(f"  {action}")
+        lines.append("")
+
+    lines.append("<i>※ 목표가·20MA·QQQ상대·거래량 자동판정. 섹터/매수논리는 별도 확인.</i>")
+    return lines
 
 
 # ── 텔레그램 ──────────────────────────────────
@@ -320,6 +609,7 @@ def build_telegram_summary(snap: dict) -> str:
         return "\n".join(lines)
 
     lines.append("<b>보유 종목</b>")
+    lines.append("")
     for r in snap["results"]:
         name = html.escape(r["name"])
         tick = html.escape(r["ticker"])
@@ -327,26 +617,46 @@ def build_telegram_summary(snap: dict) -> str:
         tgt_s  = f"${r['target']:,.0f}" if r["target"] else "-"
         to_stop = f"{(r['stop']/r['price']-1)*100:+.1f}%" if r["stop"] else "-"
         to_tgt  = f"{(r['target']/r['price']-1)*100:+.1f}%" if r["target"] else "-"
-        lines.append(
-            f"• <b>{name}</b> ({tick})  {fmt_usd_plain(r['price'])}  "
-            f"{fmt_rate(r['rate'])}\n"
-            f"  손익 {fmt_usd(r['profit'])} / {fmt_krw(r['profit'] * krw)}\n"
-            f"  손절 {stop_s} ({to_stop}) · 목표 {tgt_s} ({to_tgt})"
-        )
+        lines.append(f"• <b>{name}</b> ({tick})  {fmt_usd_plain(r['price'])}  {fmt_rate(r['rate'])}")
+        lines.append(f"  손익 {fmt_usd(r['profit'])} / {fmt_krw(r['profit'] * krw)}")
+        lines.append(f"  손절 {stop_s} ({to_stop}) · 목표 {tgt_s} ({to_tgt})")
+        lines.append("")  # 종목 사이 빈 줄
 
     total_profit_krw = snap["total_profit"] * krw
     profit_sign = "+" if snap["total_profit"] >= 0 else ""
     lines += [
-        "",
         "<b>합계</b>",
         f"평가 {fmt_krw(snap['total_value'] * krw)}  "
         f"손익 {profit_sign}{fmt_krw(total_profit_krw)}  "
         f"({fmt_rate(snap['total_rate'])})",
     ]
+    lines += build_flow_telegram_section(snap)
     return "\n".join(lines)
 
 
-def send_telegram(text: str) -> bool:
+def build_alerts_telegram(alerts: list[dict], date: str) -> str:
+    """손절·목표가 도달 전용 메시지."""
+    lines = [f"<b>⚡ 나스닥 가격 알림</b> ({html.escape(date)})", ""]
+    for a in alerts:
+        name = html.escape(a["name"])
+        tick = html.escape(a["ticker"])
+        if a["kind"] == "stop":
+            lines.append(
+                f"🚨 <b>손절가 도달</b> — {name} ({tick})\n"
+                f"현재가 {fmt_usd_plain(a['price'])} ≤ 손절가 ${a['level']:,.2f}\n"
+                f"수익률 {fmt_rate(a['rate'])} — 추세 이탈, 손절 실행"
+            )
+        else:
+            lines.append(
+                f"💰 <b>목표가 도달</b> — {name} ({tick})\n"
+                f"현재가 {fmt_usd_plain(a['price'])} ≥ 목표가 ${a['level']:,.2f}\n"
+                f"수익률 {fmt_rate(a['rate'])} — 청산 검토"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def send_telegram(text: str, label: str = "메시지") -> bool:
     """TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 있으면 전송.
     없거나 실패하면 False (로컬 실행은 secrets 없이 통과).
     """
@@ -356,7 +666,6 @@ def send_telegram(text: str) -> bool:
         print("  [텔레그램] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정 — 전송 생략")
         return False
 
-    # 텔레그램 메시지 길이 한도
     if len(text) > 4000:
         text = text[:3990] + "\n…"
 
@@ -375,19 +684,116 @@ def send_telegram(text: str) -> bool:
         if not data.get("ok"):
             print(f"  [텔레그램] 전송 실패: {data}")
             return False
-        print("  [텔레그램] 일일 리포트 전송 완료")
+        print(f"  [텔레그램] {label} 전송 완료")
         return True
     except Exception as e:
         print(f"  [텔레그램] 전송 오류: {e}")
         return False
 
 
-def main():
+def send_price_alerts(snap: dict) -> int:
+    """신규 손절·목표가 도달 알림만 텔레그램 전송. 전송 성공 시에만 중복 방지 기록."""
+    alerts = snap.get("new_alerts") or []
+    if not alerts:
+        print("  [알림] 신규 손절/목표가 도달 없음")
+        return 0
+    for a in alerts:
+        kind = "손절" if a["kind"] == "stop" else "목표"
+        print(f"  [알림] {kind} 신규 — {a['name']} ({a['ticker']}) "
+              f"${a['price']:,.2f} / ${a['level']:,.2f}")
+    ok = send_telegram(
+        build_alerts_telegram(alerts, snap["date"]), label="가격 알림"
+    )
+    if ok:
+        history = load_history()
+        mark_alerts_sent(history, alerts)
+        save_history(history)
+        return len(alerts)
+    print("  [알림] 전송 실패/생략 — 다음 점검에서 재시도")
+    return 0
+
+
+def run_daily():
     snap = build_portfolio_snapshot()
     print_portfolio(snap)
-    msg = build_telegram_summary(snap)
-    # CI에서는 secrets가 있을 때만 전송. 로컬도 env 설정 시 전송됨.
-    send_telegram(msg)
+    # 일일 리포트보다 먼저: 아직 안 보낸 손절/목표가 알림
+    send_price_alerts(snap)
+    send_telegram(build_telegram_summary(snap), label="일일 리포트")
+
+
+def run_alerts_only():
+    """장중 점검: 손절/목표가 새로 닿았을 때만 텔레그램 전송."""
+    snap = build_portfolio_snapshot(with_flow=False)
+    print(f"  [알림전용] {snap['date']} 보유 {len(snap['results'])}종목 점검")
+    for r in snap["results"]:
+        stop_s = f"${r['stop']:,.0f}" if r["stop"] else "-"
+        tgt_s  = f"${r['target']:,.0f}" if r["target"] else "-"
+        print(f"    {r['name']} ({r['ticker']}) {fmt_usd_plain(r['price'])} "
+              f"손절 {stop_s} 목표 {tgt_s} 수익률 {fmt_rate(r['rate'])}")
+    send_price_alerts(snap)
+
+
+def run_test_notify():
+    """일일 리포트 + 손절/목표가 샘플 알림을 각각 전송 (중복방지 기록 안 함)."""
+    snap = build_portfolio_snapshot()
+    print_portfolio(snap)
+
+    print("  [테스트] 1/3 일일 리포트 전송...")
+    send_telegram(build_telegram_summary(snap), label="일일 리포트(테스트)")
+
+    sample = snap["results"][0] if snap["results"] else {
+        "name": "테스트종목", "ticker": "TEST",
+        "price": 100.0, "stop": 110.0, "target": 90.0, "rate": -10.0,
+    }
+    stop_lvl = sample.get("stop") or sample["price"] * 0.9
+    tgt_lvl  = sample.get("target") or sample["price"] * 1.1
+
+    print("  [테스트] 2/3 손절가 알림 전송...")
+    send_telegram(
+        build_alerts_telegram([{
+            "kind": "stop",
+            "name": sample["name"],
+            "ticker": sample["ticker"],
+            "price": min(sample["price"], stop_lvl),
+            "level": stop_lvl,
+            "rate": sample["rate"],
+        }], snap["date"]) + "\n\n<i>※ 손절가 알림 테스트 메시지입니다.</i>",
+        label="손절가 알림(테스트)",
+    )
+
+    print("  [테스트] 3/3 목표가 알림 전송...")
+    send_telegram(
+        build_alerts_telegram([{
+            "kind": "target",
+            "name": sample["name"],
+            "ticker": sample["ticker"],
+            "price": max(sample["price"], tgt_lvl),
+            "level": tgt_lvl,
+            "rate": ((tgt_lvl / sample.get("avg", sample["price"])) - 1) * 100
+                    if sample.get("avg") else sample["rate"],
+        }], snap["date"]) + "\n\n<i>※ 목표가 알림 테스트 메시지입니다.</i>",
+        label="목표가 알림(테스트)",
+    )
+    print("  [테스트] 3건 전송 시도 완료")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="나스닥 포트폴리오 / 텔레그램 알림")
+    parser.add_argument(
+        "--alerts-only", action="store_true",
+        help="손절·목표가 신규 도달 시에만 텔레그램 전송 (장중 점검용)",
+    )
+    parser.add_argument(
+        "--test-notify", action="store_true",
+        help="일일 리포트·손절·목표가 알림을 각각 테스트 전송",
+    )
+    args = parser.parse_args()
+    if args.test_notify:
+        run_test_notify()
+    elif args.alerts_only:
+        run_alerts_only()
+    else:
+        run_daily()
 
 
 if __name__ == "__main__":
