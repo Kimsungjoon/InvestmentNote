@@ -809,6 +809,41 @@ def run_test_notify():
     print("  [테스트] 3건 전송 시도 완료")
 
 
+def run_test_stop(ticker: str = "HWM"):
+    """특정 종목 손절가 도달 테스트 알림만 전송 (중복방지 기록 안 함)."""
+    snap = build_portfolio_snapshot(with_flow=False)
+    sample = next((r for r in snap["results"] if r["ticker"] == ticker), None)
+    if sample is None and snap["results"]:
+        sample = snap["results"][0]
+        print(f"  [테스트] {ticker} 없음 → {sample['ticker']}로 대체")
+    if sample is None:
+        # 포트폴리오에 없어도 HWM 손절 테스트용 고정 메시지
+        sample = {
+            "name": "하우멧 에어로스페이스", "ticker": "HWM",
+            "price": 252.0, "stop": 252.0, "rate": -9.87, "avg": 279.5975,
+        }
+        print("  [테스트] 보유 조회 실패 → HWM 고정 샘플 사용")
+
+    stop_lvl = sample.get("stop") or 252.0
+    # 도달 상황을 가정: 현재가/저가를 손절가 이하로 표시
+    hit_price = min(sample["price"], stop_lvl)
+    print(f"  [테스트] {sample['name']} ({sample['ticker']}) "
+          f"손절 ${stop_lvl:,.2f} 도달 가정 → 전송...")
+    ok = send_telegram(
+        build_alerts_telegram([{
+            "kind": "stop",
+            "name": sample["name"],
+            "ticker": sample["ticker"],
+            "price": hit_price,
+            "level": stop_lvl,
+            "rate": (hit_price / sample["avg"] - 1) * 100 if sample.get("avg") else sample["rate"],
+        }], snap["date"]) + "\n\n<i>※ HWM 손절가 도달 테스트 메시지입니다. (실제 청산 아님)</i>",
+        label="HWM 손절가 알림(테스트)",
+    )
+    if not ok:
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="나스닥 포트폴리오 / 텔레그램 알림")
     parser.add_argument(
@@ -819,8 +854,14 @@ def main():
         "--test-notify", action="store_true",
         help="일일 리포트·손절·목표가 알림을 각각 테스트 전송",
     )
+    parser.add_argument(
+        "--test-stop", metavar="TICKER", nargs="?", const="HWM", default=None,
+        help="손절가 도달 테스트 알림만 전송 (기본: HWM)",
+    )
     args = parser.parse_args()
-    if args.test_notify:
+    if args.test_stop is not None:
+        run_test_stop(args.test_stop.upper())
+    elif args.test_notify:
         run_test_notify()
     elif args.alerts_only:
         run_alerts_only()

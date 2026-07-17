@@ -19,6 +19,7 @@ on:
           - daily
           - alerts
           - test
+          - test-stop
 
 permissions:
   contents: write
@@ -62,7 +63,9 @@ jobs:
             echo "schedule 시각 UTC ${HOUR}:${MIN}"
           fi
           echo "실행 모드: $MODE (UTC $(date -u +%H:%M))"
-          if [ "$MODE" = "test" ]; then
+          if [ "$MODE" = "test-stop" ]; then
+            python portfolio.py --test-stop HWM
+          elif [ "$MODE" = "test" ]; then
             python portfolio.py --test-notify
           elif [ "$MODE" = "alerts" ]; then
             python portfolio.py --alerts-only
@@ -71,7 +74,7 @@ jobs:
           fi
 
       - name: 결과 파일 커밋 & 푸시
-        if: ${{ github.event.inputs.mode != 'test' }}
+        if: ${{ github.event.inputs.mode != 'test' && github.event.inputs.mode != 'test-stop' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
