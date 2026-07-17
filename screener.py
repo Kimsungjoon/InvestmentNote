@@ -7,6 +7,8 @@
 ────────────────────────────────────────────────────────────────────────
 사용법:
   python3 screener.py            나스닥 스캔 (기본)
+  python3 screener.py --report        나스닥 스캔 + 매수후보 리포트 저장
+  python3 screener.py --report-kospi  코스피 스캔 + 매수후보 리포트 저장
   python3 screener.py --kospi    코스피 스캔
 """
 
@@ -24,8 +26,13 @@ INCOMPLETE_VOL_RATIO = 0.50  # 당일 거래량이 20일 평균의 50% 미만이
 # ══════════════════════════════════════════════════════════════════════
 NASDAQ_INDEX  = "QQQ"
 ND_MIN_CAP_B  = 10      # 시총 하한 ($B) — 마이크로캡 제외
-ND_MAX_PRICE  = 800     # 단가 상한 ($)
 ND_MAX_DEBT   = 200     # 부채비율 상한 (%)
+
+# ── 펀더멘털 (성장주: PER 절대값보다 ROE·성장·PEG 우선, PER 과열은 상한) ──
+ND_ROE_MIN         = 0.07   # ROE 하한 (7%) — 미확인 시 탈락
+ND_REV_GROWTH_MIN  = 0.05   # 매출성장 하한 (5%)
+ND_PEG_MAX         = 2.5    # PEG 상한 — forward PER 우선, 없으면 trailing
+ND_PER_MAX         = 80     # trailing PER 절대 상한
 
 # ── 눌림목: 상승추세 + 5/20MA 근처 조정 + 거래량 수축 ──
 PB_5MA_RANGE  = 2.5     # 5MA 이격 ±2.5% 이내
@@ -61,7 +68,8 @@ KS_DEBT_MAX   = 200     # 부채비율 상한 (%)
 KS_RSI_MIN    = 38
 KS_RSI_MAX    = 70
 KS_FLOW_DAYS  = 5       # 수급 가점: 기관+외국인 N일 누적 순매수 > 0
-KS_TGT_GAP    = 0.15    # 목표주가 괴리율 하한 (15%)
+KS_TGT_GAP    = 0.20    # 목표주가 괴리율 하한 (20%) — 코스피_후보발굴_프롬프트 §2·§6·§9
+ND_EXT_20MA_MAX = 8.0   # 눌림목: 20MA 대비 이격 상한 (%) — 제외 필터 §6
 
 # ══════════════════════════════════════════════════════════════════════
 #  나스닥 종목 리스트 (~220개, 나스닥100 + 성장/모멘텀 확장 유니버스)
@@ -328,6 +336,7 @@ def fetch_fundamentals(session, crumb, ticker: str) -> dict:
 
         pbr = raw(sd, "priceToBook") or raw(ks, "priceToBook")
         per = raw(sd, "trailingPE")  or raw(ks, "trailingPE")
+        forward_per = raw(sd, "forwardPE") or raw(ks, "forwardPE")
 
         return {
             "roe":           raw(fd, "returnOnEquity"),
@@ -335,6 +344,7 @@ def fetch_fundamentals(session, crumb, ticker: str) -> dict:
             "rev_growth":    raw(fd, "revenueGrowth"),
             "profit_margin": raw(fd, "profitMargins"),
             "per":           per,
+            "forward_per":   forward_per,
             "pbr":           pbr,
             "target_mean":   raw(fd, "targetMeanPrice"),
         }
@@ -371,6 +381,142 @@ def _parse_signed_int(text: str) -> int | None:
         return int(s)
     except ValueError:
         return None
+
+
+def _parse_naver_float(text) -> float | None:
+    """네이버 금융 숫자 문자열 → float ('9.43배', '161,950', '1,377.89' 등)."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s or s in ("-", "N/A", "nan"):
+        return None
+    s = s.split("l")[0].split("L")[0].strip()
+    s = re.sub(r"[^\d.\-+]", "", s.replace(",", ""))
+    if not s or s in (".", "-", "+"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _naver_fin_row_latest(cols: dict) -> float | None:
+    if not cols:
+        return None
+    for _, cell in reversed(list(cols.items())):
+        val = _parse_naver_float(cell.get("value") if isinstance(cell, dict) else cell)
+        if val is not None and val > 0:
+            return val
+    return None
+
+
+def fetch_naver_fundamentals(code: str) -> dict:
+    """네이버 금융 API·재무표에서 PER/PBR/ROE/부채비율/목표주가 등 조회.
+
+    - integration API: PER, PBR, 컨센서스 목표주가
+    - finance/quarter: ROE, 부채비율, 영업이익률
+    - finance/annual: 매출 YoY 성장률
+    """
+    headers = {**HEADERS, "Referer": "https://finance.naver.com/"}
+    fund: dict = {"source": "naver"}
+
+    try:
+        res = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/integration",
+            headers=headers, timeout=12,
+        )
+        data = res.json()
+    except Exception:
+        return fund
+
+    ci = data.get("consensusInfo") or {}
+    tgt = _parse_naver_float(ci.get("priceTargetMean"))
+    if tgt:
+        fund["target_mean"] = tgt
+
+    for item in data.get("totalInfos") or []:
+        code_key = item.get("code")
+        val = _parse_naver_float(item.get("value"))
+        if val is None:
+            continue
+        if code_key == "per":
+            fund["per"] = val
+        elif code_key == "pbr":
+            fund["pbr"] = val
+        elif code_key == "cnsPer":
+            fund["forward_per"] = val
+        elif code_key == "dividendYieldRatio":
+            fund["dividend_yield"] = val / 100.0
+
+    try:
+        fq = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/finance/quarter",
+            headers=headers, timeout=12,
+        ).json()
+        rows = {
+            row["title"]: row["columns"]
+            for row in fq.get("financeInfo", {}).get("rowList", [])
+        }
+        roe = _naver_fin_row_latest(rows.get("ROE"))
+        if roe is not None:
+            fund["roe"] = roe / 100.0
+        pm = _naver_fin_row_latest(rows.get("영업이익률"))
+        if pm is not None:
+            fund["profit_margin"] = pm / 100.0
+        dte = _naver_fin_row_latest(rows.get("부채비율"))
+        if dte is not None:
+            fund["debt_equity"] = dte
+            fund["financial_sector"] = dte > 500
+    except Exception:
+        pass
+
+    try:
+        fa = requests.get(
+            f"https://m.stock.naver.com/api/stock/{code}/finance/annual",
+            headers=headers, timeout=12,
+        ).json()
+        rev_cols = {
+            row["title"]: row["columns"]
+            for row in fa.get("financeInfo", {}).get("rowList", [])
+        }.get("매출액", {})
+        keys = sorted(rev_cols.keys())
+        if len(keys) >= 2:
+            prev = _parse_naver_float(rev_cols[keys[-2]].get("value"))
+            curr = _parse_naver_float(rev_cols[keys[-1]].get("value"))
+            if prev and curr and prev > 0:
+                fund["rev_growth"] = (curr - prev) / prev
+    except Exception:
+        pass
+
+    if fund.get("per") is None or fund.get("pbr") is None:
+        try:
+            summ = requests.get(
+                f"https://api.finance.naver.com/service/itemSummary.nhn?itemcode={code}",
+                headers=headers, timeout=10,
+            ).json()
+            if fund.get("per") is None and summ.get("per"):
+                fund["per"] = float(summ["per"])
+            if fund.get("pbr") is None and summ.get("pbr"):
+                fund["pbr"] = float(summ["pbr"])
+        except Exception:
+            pass
+
+    return fund
+
+
+def fetch_kospi_fundamentals(session, crumb, ticker: str) -> dict:
+    """코스피: 네이버 금융 우선, 누락 필드만 Yahoo 보완."""
+    code = to_krx_code(ticker)
+    fund = fetch_naver_fundamentals(code)
+    yahoo = fetch_fundamentals(session, crumb, ticker)
+    for key, val in yahoo.items():
+        if val is None:
+            continue
+        if fund.get(key) is None:
+            fund[key] = val
+    if fund.get("source") != "naver":
+        fund["source"] = "naver+yahoo"
+    return fund
 
 
 def fetch_naver_investor_flow(code: str) -> list[dict] | None:
@@ -526,6 +672,63 @@ def check_regime(index_ticker: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  나스닥 펀더멘털 검증
+# ══════════════════════════════════════════════════════════════════════
+
+def _to_float(v) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _nasdaq_peg(per: float | None, rev_growth: float | None) -> float | None:
+    per = _to_float(per)
+    if per and per > 0 and rev_growth and rev_growth >= ND_REV_GROWTH_MIN:
+        return per / (rev_growth * 100)
+    return None
+
+
+def check_nasdaq_fundamentals(fund: dict) -> tuple[bool, list[str], float | None,
+                                                          float | None, float | None]:
+    """성장주 펀더 게이트. PEG는 forward PER 우선, PER 절대상한은 trailing 기준."""
+    reasons: list[str] = []
+    roe = fund.get("roe")
+    rg = fund.get("rev_growth")
+    pm = fund.get("profit_margin")
+    trailing_per = _to_float(fund.get("per"))
+    forward_per = _to_float(fund.get("forward_per"))
+    dte = fund.get("debt_equity")
+
+    if dte is not None and dte > ND_MAX_DEBT:
+        reasons.append("부채↑")
+    if roe is None:
+        reasons.append("ROE?")
+    elif roe < ND_ROE_MIN:
+        reasons.append("ROE↓")
+    if rg is None:
+        reasons.append("성장?")
+    elif rg < ND_REV_GROWTH_MIN:
+        reasons.append("성장↓")
+    if pm is not None and pm <= 0:
+        reasons.append("적자")
+    # PER 절대 상한: trailing (현재 이익 기준 과열 방어)
+    if trailing_per is None or trailing_per <= 0:
+        reasons.append("PER?")
+    elif trailing_per > ND_PER_MAX:
+        reasons.append("PER↑")
+
+    peg_trailing = _nasdaq_peg(trailing_per, rg)
+    peg_forward = _nasdaq_peg(forward_per, rg)
+    peg = peg_forward if peg_forward is not None else peg_trailing
+
+    if peg is not None and peg > ND_PEG_MAX:
+        reasons.append("PEG↑")
+
+    return len(reasons) == 0, reasons, peg, peg_forward, peg_trailing
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  나스닥 종목 분석
 # ══════════════════════════════════════════════════════════════════════
 
@@ -555,10 +758,12 @@ def analyze_nasdaq(ticker: str, name: str, cap: float | None,
     from_high = (price - high_52w) / high_52w * 100
 
     recent_20   = closes[-20:] if len(closes) >= 20 else closes
+    swing_low_20 = min(recent_20) if recent_20 else None
     range_20d   = ((max(recent_20) - min(recent_20)) / price * 100) if price else None
     ret_stock   = ret_nd(closes, 20)
 
     ext_5ma   = ((price - ma5) / ma5 * 100)    if ma5  else None
+    ext_20ma  = ((price - ma20) / ma20 * 100)  if ma20 else None
     ext_5_20  = ((ma5 - ma20)  / ma20 * 100)   if (ma5 and ma20)  else None
     ext_20_50 = ((ma20 - ma50) / ma50 * 100)   if (ma20 and ma50) else None
 
@@ -577,17 +782,18 @@ def analyze_nasdaq(ticker: str, name: str, cap: float | None,
 
     # 기본 필터
     cap_ok   = cap is None or cap >= ND_MIN_CAP_B
-    price_ok = price <= ND_MAX_PRICE
     dte      = fund.get("debt_equity")
     debt_ok  = dte is None or dte <= ND_MAX_DEBT
 
     entry_type = None
-    if trend_ok and cap_ok and price_ok and debt_ok:
+    if trend_ok and cap_ok and debt_ok and rs_ok:
 
-        # ① 눌림목: 5MA 근처 + RSI 건강 + 거래량 수축
+        # ① 눌림목: 정배열 + 5MA 근처 + RSI 건강 + 거래량 수축 + 20MA 이격 과대 배제
         pb_ok = (
-            ext_5ma is not None and abs(ext_5ma) <= PB_5MA_RANGE
+            aligned
+            and ext_5ma is not None and abs(ext_5ma) <= PB_5MA_RANGE
             and ext_5_20 is not None and ext_5_20 > -PB_FROM_20MA
+            and (ext_20ma is None or ext_20ma <= ND_EXT_20MA_MAX)
             and r is not None and PB_RSI_MIN <= r <= PB_RSI_MAX
             and (vol_ratio_5d is None or vol_ratio_5d <= PB_VOL_MAX)
         )
@@ -616,23 +822,34 @@ def analyze_nasdaq(ticker: str, name: str, cap: float | None,
         elif sq_ok:
             entry_type = "에너지응축"
 
+    tech_entry_type = entry_type
+    fund_ok, fund_fail, peg, peg_forward, peg_trailing = check_nasdaq_fundamentals(fund)
+    if entry_type and not fund_ok:
+        entry_type = None
+
     # RS 점수 (전체 순위 비교용)
     rs_score = ret_stock if ret_stock is not None else -999
 
     return {
         "ticker": ticker, "name": name, "price": price, "cap": cap,
         "rsi": r, "from_high": from_high,
-        "ext_5ma": ext_5ma, "ext_5_20": ext_5_20, "ext_20_50": ext_20_50,
+        "ext_5ma": ext_5ma, "ext_20ma": ext_20ma, "ext_5_20": ext_5_20, "ext_20_50": ext_20_50,
         "range_20d": range_20d, "vol_ratio_5d": vol_ratio_5d,
         "ret_20d": ret_stock, "rs_ok": rs_ok, "rs_score": rs_score,
         "trend_ok": trend_ok, "aligned": aligned,
         "above_50ma": above_50ma, "above_200ma": above_200ma,
-        "cap_ok": cap_ok, "price_ok": price_ok, "debt_ok": debt_ok,
-        "entry_type": entry_type, "regime_ok": regime_ok,
+        "cap_ok": cap_ok, "debt_ok": debt_ok,
+        "entry_type": entry_type, "tech_entry_type": tech_entry_type,
+        "fund_ok": fund_ok, "fund_fail": fund_fail,
+        "peg": peg, "peg_forward": peg_forward, "peg_trailing": peg_trailing,
+        "regime_ok": regime_ok,
         "ma5": ma5, "ma20": ma20, "ma50": ma50,
         "roe": fund.get("roe"), "debt_equity": dte,
         "rev_growth": fund.get("rev_growth"),
-        "per": fund.get("per"),
+        "profit_margin": fund.get("profit_margin"),
+        "per": fund.get("per"), "forward_per": fund.get("forward_per"),
+        "target_mean": fund.get("target_mean"),
+        "swing_low_20": swing_low_20,
         "vol_intraday": vol_intraday,
     }
 
@@ -667,6 +884,9 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
     from_high = (price - high_52w) / high_52w * 100
     from_low  = (price - low_52w)  / low_52w  * 100
 
+    recent_20 = closes[-20:] if len(closes) >= 20 else closes
+    swing_low_20 = min(recent_20) if recent_20 else None
+
     ret_stock = ret_nd(closes, 20)
     rs_ok = (ret_stock is not None and benchmark_ret is not None
              and ret_stock > benchmark_ret)
@@ -684,6 +904,9 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
     tgt_gap = ((tgt / price) - 1) if (tgt and price and tgt > 0) else None
 
     flow = flow or summarize_investor_flow(None)
+    flow_ok = flow.get("flow_ok") or (
+        (flow.get("flow_10d") or 0) > 0 and (flow.get("flow_20d") or 0) > 0
+    )
 
     # ── 10점 만점 점수화 ──────────────────────────────────────────
     score = 0
@@ -703,10 +926,11 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
     # 수급/기술 (최대 3점) — 수급은 네이버 기관·외국인 순매수 (거래량 근사 금지)
     if ma20 is not None and price > ma20:                  score += 1
     if r    is not None and KS_RSI_MIN <= r <= KS_RSI_MAX: score += 1
-    if flow.get("flow_ok"):                                score += 1
+    if flow_ok:                                score += 1
 
     # ── 필수 탈락 기준 ──────────────────────────────────────────
-    debt_ok  = dte is None or dte <= KS_DEBT_MAX
+    financial = fund.get("financial_sector")
+    debt_ok  = dte is None or dte <= KS_DEBT_MAX or financial
     roe_ok   = roe is None or roe >= KS_ROE_MIN
     pbr_pass = pbr is None or pbr <= KS_PBR_MAX
     per_pass = per is None or per <= KS_PER_MAX
@@ -738,10 +962,14 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
         "pbr": pbr, "per": per, "roe": roe, "dte": dte,
         "rev_growth": rg, "profit_margin": pm,
         "target_mean": tgt, "tgt_gap": tgt_gap,
+        "swing_low_20": swing_low_20,
         "score": score, "category": category,
         "qualified": qualified, "exclude_reason": exclude_reason,
+        "financial_sector": financial,
+        "fund_source": fund.get("source"),
         "vol_intraday": vol_intraday, "regime_ok": regime_ok,
-        **flow,
+        "flow_ok": flow_ok,
+        **{k: v for k, v in flow.items() if k != "flow_ok"},
     }
 
 
@@ -762,7 +990,7 @@ def _nasdaq_worker(session, crumb, tick, name, cap, regime_ok, bench):
 
 def _kospi_worker(session, crumb, tick, name, regime_ok, bench):
     try:
-        fund = fetch_fundamentals(session, crumb, tick)
+        fund = fetch_kospi_fundamentals(session, crumb, tick)
         flow = summarize_investor_flow(
             fetch_naver_investor_flow(to_krx_code(tick))
         )
@@ -813,7 +1041,16 @@ def _print_nasdaq_stock(a: dict):
     roe_s = _f(a['roe'], '%', 1, 100)
     dte_s = _f(a['debt_equity'], '%', 0)
     rg_s  = _f(a['rev_growth'],  '%', 1, 100)
-    print(f"    [펀더] ROE {roe_s}  부채비율 {dte_s}  매출성장 {rg_s}  PER {_f(a['per'],nd=1)}")
+    per_s = _f(a['per'], nd=1)
+    fwd_s = _f(a.get('forward_per'), nd=1)
+    peg_used = a.get("peg_forward") if a.get("peg_forward") is not None else a.get("peg_trailing")
+    peg_lbl = "fwd" if a.get("peg_forward") is not None else "trail"
+    peg_s = _f(peg_used, nd=1)
+    peg_extra = ""
+    if a.get("peg_forward") is not None and a.get("peg_trailing") is not None:
+        peg_extra = f" (trail {_f(a['peg_trailing'], nd=1)})"
+    print(f"    [펀더] ROE {roe_s}  부채비율 {dte_s}  매출성장 {rg_s}"
+          f"  PER {per_s}  fwdPER {fwd_s}  PEG {peg_s}({peg_lbl}){peg_extra}")
 
 
 def _fmt_shares(n) -> str:
@@ -860,52 +1097,80 @@ def _print_kospi_stock(a: dict):
 #  나스닥 메인 루틴
 # ══════════════════════════════════════════════════════════════════════
 
-def run_nasdaq():
-    _sep()
-    print("  나스닥 매수 후보발굴 스크리너")
-    print(f"  기준: QQQ 상대강도 · 눌림목(5MA±{PB_5MA_RANGE}%·RSI {PB_RSI_MIN}~{PB_RSI_MAX}·거래량수축)")
-    print(f"       돌파(고점{BK_FROM_HIGH}%이내·RSI {BK_RSI_MIN}~{BK_RSI_MAX}·거래량≥{BK_VOL_MIN}x)")
-    print(f"       에너지응축(5-20MA≤{SQ_5_20_MAX}%·20일레인지≤{SQ_RANGE_MAX}%·RSI {SQ_RSI_MIN}~{SQ_RSI_MAX})")
-    _sep()
-
-    session, crumb = make_session()
-
-    regime = check_regime(NASDAQ_INDEX)
-    flag = "🟢 진입 허용" if regime["ok"] else "🔴 진입 보류"
-    print(f"  [시장 레짐] QQQ {_f(regime['price'])} / 50MA {_f(regime['ma50'])} "
-          f"→ {regime['reason']}  {flag}  QQQ 20일 {_f(regime['ret_20d'],'%',1)}")
-    if not regime["ok"]:
-        print("  ⚠ QQQ 50MA 이탈 — 후보는 표시하되 실제 진입은 50MA 회복 후 권장.")
-    _sep()
-
-    print(f"  종목 {len(NASDAQ_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
-    caps  = fetch_marketcaps(session, crumb, list(NASDAQ_CANDIDATES.keys()))
-    bench = regime["ret_20d"]
-
-    items = [(tick, name, caps.get(tick)) for tick, name in NASDAQ_CANDIDATES.items()]
-    results = _run_parallel(_nasdaq_worker, session, crumb, items, regime["ok"], bench)
-
-    pullbacks  = [a for a in results if a["entry_type"] == "눌림목"]
-    breakouts  = [a for a in results if a["entry_type"] == "돌파"]
-    squeezes   = [a for a in results if a["entry_type"] == "에너지응축"]
-
-    # 눌림목: RSI 중앙(52) 가까울수록, 5MA이격 작을수록 우수
+def _sort_nasdaq_groups(pullbacks, breakouts, squeezes):
     pullbacks.sort(key=lambda x: (
         -abs((x["rsi"] or 52) - 52) - abs(x["ext_5ma"] or 0) * 2
         + (2 if x["rs_ok"] else 0)
     ), reverse=True)
-
-    # 돌파: 고점 근접 + 거래량 높을수록 우수
     breakouts.sort(key=lambda x: (
         (x["from_high"] or -99) + (x["vol_ratio_5d"] or 0) * 5
         + (2 if x["rs_ok"] else 0)
     ), reverse=True)
-
-    # 에너지응축: MA 간격 좁을수록, RS 있으면 우수
     squeezes.sort(key=lambda x: (
         -(abs(x["ext_5_20"] or 0) + abs(x["ext_20_50"] or 0))
         + (2 if x["rs_ok"] else 0)
     ), reverse=True)
+
+
+def scan_nasdaq(verbose: bool = True) -> dict:
+    """나스닥 스크리너 실행 후 구조화된 결과 반환."""
+    if verbose:
+        _sep()
+        print("  나스닥 매수 후보발굴 스크리너")
+        print(f"  기준: QQQ 상대강도 · 눌림목(5MA±{PB_5MA_RANGE}%·RSI {PB_RSI_MIN}~{PB_RSI_MAX}·거래량수축)")
+        print(f"       돌파(고점{BK_FROM_HIGH}%이내·RSI {BK_RSI_MIN}~{BK_RSI_MAX}·거래량≥{BK_VOL_MIN}x)")
+        print(f"       에너지응축(5-20MA≤{SQ_5_20_MAX}%·20일레인지≤{SQ_RANGE_MAX}%·RSI {SQ_RSI_MIN}~{SQ_RSI_MAX})")
+        print(f"       펀더(ROE≥{ND_ROE_MIN*100:.0f}%·성장≥{ND_REV_GROWTH_MIN*100:.0f}%·forwardPEG≤{ND_PEG_MAX}·trailingPER≤{ND_PER_MAX})")
+        _sep()
+
+    session, crumb = make_session()
+    regime = check_regime(NASDAQ_INDEX)
+
+    if verbose:
+        flag = "🟢 진입 허용" if regime["ok"] else "🔴 진입 보류"
+        print(f"  [시장 레짐] QQQ {_f(regime['price'])} / 50MA {_f(regime['ma50'])} "
+              f"→ {regime['reason']}  {flag}  QQQ 20일 {_f(regime['ret_20d'],'%',1)}")
+        if not regime["ok"]:
+            print("  ⚠ QQQ 50MA 이탈 — 후보는 표시하되 실제 진입은 50MA 회복 후 권장.")
+        _sep()
+        print(f"  종목 {len(NASDAQ_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
+
+    caps = fetch_marketcaps(session, crumb, list(NASDAQ_CANDIDATES.keys()))
+    bench = regime["ret_20d"]
+    items = [(tick, name, caps.get(tick)) for tick, name in NASDAQ_CANDIDATES.items()]
+    results = _run_parallel(_nasdaq_worker, session, crumb, items, regime["ok"], bench)
+
+    pullbacks = [a for a in results if a["entry_type"] == "눌림목"]
+    breakouts = [a for a in results if a["entry_type"] == "돌파"]
+    squeezes = [a for a in results if a["entry_type"] == "에너지응축"]
+    _sort_nasdaq_groups(pullbacks, breakouts, squeezes)
+
+    fund_rejected = [a for a in results if a.get("tech_entry_type") and not a.get("fund_ok")]
+    passed = pullbacks + breakouts + squeezes
+    tech_passed = [a for a in results if a.get("tech_entry_type")]
+
+    return {
+        "regime": regime,
+        "bench": bench,
+        "universe_size": len(NASDAQ_CANDIDATES),
+        "results": results,
+        "passed": passed,
+        "pullbacks": pullbacks,
+        "breakouts": breakouts,
+        "squeezes": squeezes,
+        "fund_rejected": fund_rejected,
+        "tech_passed_count": len(tech_passed),
+    }
+
+
+def run_nasdaq():
+    scan = scan_nasdaq(verbose=True)
+    results = scan["results"]
+    pullbacks = scan["pullbacks"]
+    breakouts = scan["breakouts"]
+    squeezes = scan["squeezes"]
+    fund_rejected = scan["fund_rejected"]
+    bench = scan["bench"]
 
     # ── 섹션별 출력 ──
     print(f"\n  ━━ 눌림목 후보 ({len(pullbacks)}개) ━━")
@@ -929,6 +1194,15 @@ def run_nasdaq():
     if squeezes:
         for a in squeezes:
             _print_nasdaq_stock(a)
+    else:
+        print("  (해당 없음)")
+
+    print(f"\n  ━━ 기술 통과·펀더 미달 ({len(fund_rejected)}개) ━━")
+    print(f"     차트 조건은 맞지만 ROE·성장·forwardPEG·trailingPER(≤{ND_PER_MAX}) 미충족")
+    if fund_rejected:
+        for a in fund_rejected:
+            fail = ",".join(a.get("fund_fail") or ["펀더X"])
+            print(f"  {a['name']} ({a['ticker']})  [{a['tech_entry_type']}]  → {fail}")
     else:
         print("  (해당 없음)")
 
@@ -973,10 +1247,11 @@ def run_nasdaq():
 def _nd_tag(a: dict) -> str:
     if not a["cap_ok"]:
         return "시총↓"
-    if not a["price_ok"]:
-        return "단가↑"
     if not a["debt_ok"]:
         return "부채↑"
+    if a.get("tech_entry_type") and not a.get("fund_ok"):
+        fails = a.get("fund_fail") or []
+        return fails[0] if fails else "펀더X"
     if not a["above_50ma"]:
         return "추세X"
     if not a["regime_ok"]:
@@ -997,33 +1272,59 @@ def _nd_tag(a: dict) -> str:
 #  코스피 메인 루틴
 # ══════════════════════════════════════════════════════════════════════
 
-def run_kospi():
-    _sep()
-    print("  코스피 매수 후보발굴 스크리너")
-    print(f"  기준: 안전마진(PBR≤{KS_PBR_MAX}) · 실적모멘텀(목표가괴리율≥{KS_TGT_GAP*100:.0f}%)")
-    print(f"       수급전환(기관+외인 {KS_FLOW_DAYS}일 누적순매수>0 · 네이버) · 재무안정성(ROE≥{KS_ROE_MIN*100:.0f}%·부채≤{KS_DEBT_MAX}%)")
-    print(f"  점수: 가치(3) + 실적/성장(4) + 수급/기술(3) = 10점 | 우선후보≥7 관찰후보≥5")
-    _sep()
+def scan_kospi(verbose: bool = True) -> dict:
+    """코스피 스크리너 실행 후 구조화된 결과 반환."""
+    if verbose:
+        _sep()
+        print("  코스피 매수 후보발굴 스크리너")
+        print(f"  기준: 네이버 금융(PER/PBR/ROE/부채·목표) · 안전마진(PBR≤{KS_PBR_MAX}) · 실적모멘텀(목표가괴리율≥{KS_TGT_GAP*100:.0f}%)")
+        print(f"       수급전환(기관+외인 {KS_FLOW_DAYS}일·10/20일 누적순매수>0 · 네이버) · 재무안정성(ROE≥{KS_ROE_MIN*100:.0f}%·부채≤{KS_DEBT_MAX}%)")
+        print(f"       목표괴리≥{KS_TGT_GAP*100:.0f}%")
+        print(f"  점수: 가치(3) + 실적/성장(4) + 수급/기술(3) = 10점 | 우선후보≥7 관찰후보≥5")
+        _sep()
 
     session, crumb = make_session()
-
     regime = check_regime(KOSPI_INDEX)
-    flag   = "🟢 강세" if regime["ok"] else "🔴 약세"
-    bench  = regime["ret_20d"]
-    print(f"  [코스피 레짐] KOSPI {_f(regime['price'],nd=0)} / 50MA {_f(regime['ma50'],nd=0)} "
-          f"→ {regime['reason']}  {flag}  KOSPI 20일 {_f(bench,'%',1)}")
-    _sep()
 
-    print(f"  종목 {len(KOSPI_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
+    if verbose:
+        flag = "🟢 강세" if regime["ok"] else "🔴 약세"
+        print(f"  [코스피 레짐] KOSPI {_f(regime['price'],nd=0)} / 50MA {_f(regime['ma50'],nd=0)} "
+              f"→ {regime['reason']}  {flag}  KOSPI 20일 {_f(regime['ret_20d'],'%',1)}")
+        _sep()
+        print(f"  종목 {len(KOSPI_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
+
+    bench = regime["ret_20d"]
     items = [(tick, name) for tick, name in KOSPI_CANDIDATES.items()]
     results = _run_parallel(_kospi_worker, session, crumb, items, regime["ok"], bench)
 
-    priority  = [a for a in results if a["category"] == "우선 후보"]
+    priority = [a for a in results if a["category"] == "우선 후보"]
     watchlist = [a for a in results if a["category"] == "관찰 후보"]
-    others    = [a for a in results if a["category"] == "조건 미달"]
+    weak = [a for a in results if a["category"] == "조건 미달" and a.get("qualified")]
+    excluded = [a for a in results if not a.get("qualified")]
 
     priority.sort(key=lambda x: x["score"], reverse=True)
     watchlist.sort(key=lambda x: x["score"], reverse=True)
+    passed = priority + watchlist
+
+    return {
+        "regime": regime,
+        "bench": bench,
+        "universe_size": len(KOSPI_CANDIDATES),
+        "results": results,
+        "passed": passed,
+        "priority": priority,
+        "watchlist": watchlist,
+        "weak": weak,
+        "excluded": excluded,
+    }
+
+
+def run_kospi():
+    scan = scan_kospi(verbose=True)
+    results = scan["results"]
+    priority = scan["priority"]
+    watchlist = scan["watchlist"]
+    bench = scan["bench"]
 
     print(f"\n  ━━ 우선 후보 (점수 7+ / {len(priority)}개) ━━")
     print("     실적모멘텀 + 안전마진 + 수급전환 동시 충족")
@@ -1082,10 +1383,24 @@ def run_kospi():
 def main():
     parser = argparse.ArgumentParser(description="나스닥/코스피 매수 후보발굴 스크리너")
     parser.add_argument("--kospi", action="store_true", help="코스피 모드로 실행")
+    parser.add_argument(
+        "--report", action="store_true",
+        help="나스닥 스캔 후 매수후보 리포트를 b_매수후보리스트/나스닥/ 에 저장",
+    )
+    parser.add_argument(
+        "--report-kospi", action="store_true",
+        help="코스피 스캔 후 매수후보 리포트를 b_매수후보리스트/코스피/ 에 저장",
+    )
     args = parser.parse_args()
 
     if args.kospi:
         run_kospi()
+    elif args.report_kospi:
+        from kospi_buy_report import run_report
+        run_report()
+    elif args.report:
+        from nasdaq_buy_report import run_report
+        run_report()
     else:
         run_nasdaq()
 
