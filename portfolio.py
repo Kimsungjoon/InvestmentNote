@@ -18,8 +18,6 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 #                  (일시적 흔들림엔 견디되 지지선·주요 이평선 이탈 시 청산)
 # 추세가 진행되면 stop_price를 지지선 상향에 맞춰 올려 관리한다(트레일).
 PORTFOLIO = [
-    {"name": "케이던스",          "ticker": "CDNS", "avg_price": 396.3280,
-     "stop_price": 358.0, "target_price": 430.0, "qty": 10, "buy_date": "2026-06-14"},
     {"name": "하우멧 에어로스페이스", "ticker": "HWM",  "avg_price": 279.5975,
      "stop_price": 252.0, "target_price": 315.0, "qty": 12, "buy_date": "2026-07-07"},
 ]
@@ -35,11 +33,28 @@ HIST_FILE  = BASE_DIR / "portfolio_history.json"
 # ── 주가 / 환율 조회 ─────────────────────────
 
 def get_price(ticker: str) -> float | None:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
+    quote = get_quote(ticker)
+    return quote["price"] if quote else None
+
+
+def get_quote(ticker: str) -> dict | None:
+    """현재가 + 당일 저가(손절 판정용). 장중 저가 이탈을 last만 보면 놓칠 수 있음."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d"
     try:
-        res  = requests.get(url, headers=HEADERS, timeout=5)
-        data = res.json()
-        return round(float(data["chart"]["result"][0]["meta"]["regularMarketPrice"]), 2)
+        res  = requests.get(url, headers=HEADERS, timeout=8)
+        result = res.json()["chart"]["result"][0]
+        meta = result["meta"]
+        q = result["indicators"]["quote"][0]
+        price = meta.get("regularMarketPrice")
+        # 당일(마지막 봉) 저가 — 장중·갭하락 손절 감지
+        lows = [x for x in (q.get("low") or []) if x is not None]
+        day_low = float(lows[-1]) if lows else None
+        if price is None:
+            return None
+        return {
+            "price": round(float(price), 2),
+            "day_low": round(day_low, 2) if day_low is not None else None,
+        }
     except Exception:
         return None
 
@@ -233,16 +248,24 @@ def update_best_return(history: dict, ticker: str, current_rate: float) -> dict:
 
 
 def check_stop_alert(ticker: str, name: str, price: float,
-                     stop_price: float | None, current_rate: float) -> list[str]:
-    """손절 알림: 현재가가 종목별 손절가(추세 이탈 기준) 이하로 내려오면 알림."""
+                     stop_price: float | None, current_rate: float,
+                     day_low: float | None = None) -> list[str]:
+    """손절 알림: 현재가 또는 당일 저가가 손절가 이하이면 알림."""
     if ticker in ALERT_EXCLUDE or stop_price is None:
         return []
-    if price <= stop_price:
-        return [
-            f"[{name} / {ticker}]  현재가 ${price:,.2f} ≤ 손절가 ${stop_price:,.2f} "
-            f"(수익률 {fmt_rate(current_rate)}) — 추세 이탈, 손절 실행"
-        ]
-    return []
+    hit_last = price <= stop_price
+    hit_low  = day_low is not None and day_low <= stop_price
+    if not (hit_last or hit_low):
+        return []
+    detail = f"현재가 ${price:,.2f}"
+    if hit_low and not hit_last:
+        detail = f"당일저가 ${day_low:,.2f} (현재 ${price:,.2f})"
+    elif hit_low:
+        detail = f"현재가 ${price:,.2f} / 당일저가 ${day_low:,.2f}"
+    return [
+        f"[{name} / {ticker}]  {detail} ≤ 손절가 ${stop_price:,.2f} "
+        f"(수익률 {fmt_rate(current_rate)}) — 추세 이탈, 손절 실행"
+    ]
 
 
 def check_target_alert(ticker: str, name: str, price: float,
@@ -287,14 +310,20 @@ def collect_pending_alerts(history: dict, results: list[dict]) -> list[dict]:
             continue
         name, price, rate = r["name"], r["price"], r["rate"]
         stop, target = r.get("stop"), r.get("target")
+        day_low = r.get("day_low")
 
-        if stop is not None and price <= stop:
+        stop_hit = (
+            stop is not None
+            and (price <= stop or (day_low is not None and day_low <= stop))
+        )
+        if stop_hit:
             key = _alert_key(tick, "stop", stop)
             active_keys.add(key)
             if key not in sent:
                 pending.append({
                     "kind": "stop", "ticker": tick, "name": name,
-                    "price": price, "level": stop, "rate": rate, "key": key,
+                    "price": min(price, day_low) if day_low is not None else price,
+                    "level": stop, "rate": rate, "key": key,
                 })
 
         if target is not None and price >= target:
@@ -375,10 +404,12 @@ def build_portfolio_snapshot(with_flow: bool = True) -> dict:
         tick  = stock["ticker"]
         avg   = stock["avg_price"]
         qty   = stock["qty"]
-        price = get_price(tick)
+        quote = get_quote(tick)
 
-        if price is None:
+        if not quote:
             continue
+        price   = quote["price"]
+        day_low = quote.get("day_low")
 
         cost   = avg * qty
         value  = price * qty
@@ -390,13 +421,14 @@ def build_portfolio_snapshot(with_flow: bool = True) -> dict:
 
         target = stock.get("target_price")
         stop   = stock.get("stop_price")
-        sell_alerts   += check_stop_alert(tick, name, price, stop, rate)
+        sell_alerts   += check_stop_alert(tick, name, price, stop, rate, day_low)
         profit_alerts += check_target_alert(tick, name, price, target, rate)
 
         total_cost  += cost
         total_value += value
         results.append({
             "name": name, "ticker": tick, "avg": avg, "price": price,
+            "day_low": day_low,
             "qty": qty, "cost": cost, "value": value, "profit": profit,
             "rate": rate, "best_return": best_return,
             "target": target, "stop": stop,

@@ -2,11 +2,10 @@ name: 포트폴리오 자동 업데이트
 
 on:
   schedule:
-    # 장중 손절/목표가 점검 — 30분마다 (미국 정규장 커버)
-    # EDT: 14:30~20:00 UTC / EST: 15:30~21:00 UTC → 14~20시 대역으로 양쪽 커버
-    - cron: '*/30 14-20 * * 1-5'
-    # 장 마감 일일 리포트
-    # EDT 20:00 / EST 21:00 UTC 마감 → 21:05 UTC
+    # 장중 손절/목표가 점검 (미국 정규장 + 개장 전후 여유)
+    # EDT: 13:30~20:00 UTC / 지연 대비 13~21시 매시·30분
+    - cron: '0,30 13-21 * * 1-5'
+    # 장 마감 일일 리포트 (21:05 UTC) — 모드 판별은 아래 스크립트
     - cron: '5 21 * * 1-5'
 
   workflow_dispatch:
@@ -51,13 +50,16 @@ jobs:
           set -e
           MODE="${INPUT_MODE:-}"
           if [ -z "$MODE" ]; then
-            # schedule: 21시 UTC → 일일 리포트, 그 외 → 알림 전용
+            # schedule: 21:00~21:59 UTC만 일일 리포트 (지연 실행 포함)
+            # 그 외 시각은 알림 전용. GitHub cron은 수분~1시간 지연될 수 있음.
             HOUR=$(date -u +%H)
+            MIN=$(date -u +%M)
             if [ "$HOUR" = "21" ]; then
               MODE=daily
             else
               MODE=alerts
             fi
+            echo "schedule 시각 UTC ${HOUR}:${MIN}"
           fi
           echo "실행 모드: $MODE (UTC $(date -u +%H:%M))"
           if [ "$MODE" = "test" ]; then
