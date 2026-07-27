@@ -29,10 +29,11 @@ ND_MIN_CAP_B  = 10      # 시총 하한 ($B) — 마이크로캡 제외
 ND_MAX_DEBT   = 200     # 부채비율 상한 (%)
 
 # ── 펀더멘털 (성장주: PER 절대값보다 ROE·성장·PEG 우선, PER 과열은 상한) ──
-ND_ROE_MIN         = 0.07   # ROE 하한 (7%) — 미확인 시 탈락
-ND_REV_GROWTH_MIN  = 0.05   # 매출성장 하한 (5%)
-ND_PEG_MAX         = 2.5    # PEG 상한 — forward PER 우선, 없으면 trailing
-ND_PER_MAX         = 80     # trailing PER 절대 상한
+ND_ROE_MIN         = 0.05   # ROE 하한 (5%) — 미확인 시 통과, 확인 시만 검사
+ND_REV_GROWTH_MIN  = 0.03   # 매출성장 하한 (3%)
+ND_PEG_MAX         = 3.0    # PEG 상한 — forward PER 우선, 없으면 trailing
+ND_PER_MAX         = 100    # PER 절대 상한 — forward 우선, 없으면 trailing (성장주 trailing 부풀림 완화)
+ND_REGIME_SOFT_PCT = 0.05   # 레짐 🟡: 50MA 대비 -5% 이내까지 제한 허용 (우상향 조건 폐지)
 
 # ── 눌림목: 상승추세 + 5/20MA 근처 조정 + 거래량 수축 ──
 PB_5MA_RANGE  = 2.5     # 5MA 이격 ±2.5% 이내
@@ -69,6 +70,14 @@ KS_RSI_MIN    = 38
 KS_RSI_MAX    = 70
 KS_FLOW_DAYS  = 5       # 수급 가점: 기관+외국인 N일 누적 순매수 > 0
 KS_TGT_GAP    = 0.20    # 목표주가 괴리율 하한 (20%) — 코스피_후보발굴_프롬프트 §2·§6·§9
+# 반도체·IT부품 — 가치 필터만 완화 (PER·부채·점수 체계는 동일)
+KS_SEMI_PBR_MAX  = 4.0
+KS_SEMI_PBR_GOOD = 2.0
+KS_SEMI_ROE_MIN  = 0.05
+KOSPI_SEMI_TICKERS = frozenset({
+    "005930.KS", "000660.KS", "011070.KS", "402340.KS",
+    "009150.KS", "000990.KS",
+})
 ND_EXT_20MA_MAX = 8.0   # 눌림목: 20MA 대비 이격 상한 (%) — 제외 필터 §6
 
 # ══════════════════════════════════════════════════════════════════════
@@ -654,21 +663,33 @@ def resolve_volume_bars(vols: list[float]) -> tuple[list, float | None, float | 
 # ══════════════════════════════════════════════════════════════════════
 
 def check_regime(index_ticker: str) -> dict:
+    """시장 레짐: 🟢 50MA 위 / 🟡 50MA -soft% 이내 / 🔴 그 이하.
+
+    기존(50MA 위+우상향)보다 완화 — 스윙에서 얕은 지수 조정을 과도하게 막지 않기 위함.
+    ok=True 는 🟢·🟡 모두 (🟡는 리포트에서 소량·RR≥2 권장).
+    """
     d = fetch_daily(index_ticker)
     if not d or len(d["close"]) < 55:
-        return {"ok": True, "price": None, "ma20": None, "ma50": None,
-                "reason": "데이터없음(통과)", "ret_20d": None}
+        return {"ok": True, "level": "ok", "price": None, "ma20": None, "ma50": None,
+                "reason": "데이터없음(통과)", "ret_20d": None,
+                "vs_50pct": None}
     closes = d["close"]
     price  = closes[-1]
     ma20   = sma(closes, 20)
     ma50   = sma(closes, 50)
-    ma50_5d = sma(closes[:-5], 50)
-    above_50  = ma50  is not None and price > ma50
-    rising_50 = ma50_5d is not None and ma50 > ma50_5d
-    ok = above_50 and rising_50
-    reason = "약세 (50MA 이탈)" if not ok else "강세 (50MA 위)"
-    return {"ok": ok, "price": price, "ma20": ma20, "ma50": ma50,
-            "reason": reason, "ret_20d": ret_nd(closes, 20)}
+    vs_50pct = ((price - ma50) / ma50) if ma50 else None
+
+    if ma50 is not None and price > ma50:
+        level, ok, reason = "ok", True, "강세 (50MA 위)"
+    elif (ma50 is not None and vs_50pct is not None
+          and vs_50pct >= -ND_REGIME_SOFT_PCT):
+        level, ok, reason = "soft", True, f"제한 허용 (50MA {-ND_REGIME_SOFT_PCT*100:.0f}% 이내)"
+    else:
+        level, ok, reason = "off", False, "약세 (50MA 이탈)"
+
+    return {"ok": ok, "level": level, "price": price, "ma20": ma20, "ma50": ma50,
+            "reason": reason, "ret_20d": ret_nd(closes, 20),
+            "vs_50pct": vs_50pct}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -684,14 +705,14 @@ def _to_float(v) -> float | None:
 
 def _nasdaq_peg(per: float | None, rev_growth: float | None) -> float | None:
     per = _to_float(per)
-    if per and per > 0 and rev_growth and rev_growth >= ND_REV_GROWTH_MIN:
+    if per and per > 0 and rev_growth and rev_growth > 0:
         return per / (rev_growth * 100)
     return None
 
 
 def check_nasdaq_fundamentals(fund: dict) -> tuple[bool, list[str], float | None,
                                                           float | None, float | None]:
-    """성장주 펀더 게이트. PEG는 forward PER 우선, PER 절대상한은 trailing 기준."""
+    """성장주 펀더 게이트. PEG·PER 절대상한 모두 forward PER 우선, 없으면 trailing."""
     reasons: list[str] = []
     roe = fund.get("roe")
     rg = fund.get("rev_growth")
@@ -702,20 +723,17 @@ def check_nasdaq_fundamentals(fund: dict) -> tuple[bool, list[str], float | None
 
     if dte is not None and dte > ND_MAX_DEBT:
         reasons.append("부채↑")
-    if roe is None:
-        reasons.append("ROE?")
-    elif roe < ND_ROE_MIN:
+    if roe is not None and roe < ND_ROE_MIN:
         reasons.append("ROE↓")
-    if rg is None:
-        reasons.append("성장?")
-    elif rg < ND_REV_GROWTH_MIN:
+    if rg is not None and rg < ND_REV_GROWTH_MIN:
         reasons.append("성장↓")
     if pm is not None and pm <= 0:
         reasons.append("적자")
-    # PER 절대 상한: trailing (현재 이익 기준 과열 방어)
-    if trailing_per is None or trailing_per <= 0:
+    # AMD처럼 trailing PER만 부푼 성장주는 forward로 과열 판정
+    per_for_cap = forward_per if (forward_per and forward_per > 0) else trailing_per
+    if per_for_cap is None or per_for_cap <= 0:
         reasons.append("PER?")
-    elif trailing_per > ND_PER_MAX:
+    elif per_for_cap > ND_PER_MAX:
         reasons.append("PER↑")
 
     peg_trailing = _nasdaq_peg(trailing_per, rg)
@@ -908,13 +926,20 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
         (flow.get("flow_10d") or 0) > 0 and (flow.get("flow_20d") or 0) > 0
     )
 
+    is_semi = ticker in KOSPI_SEMI_TICKERS
+    pbr_max = KS_SEMI_PBR_MAX if is_semi else KS_PBR_MAX
+    pbr_good = KS_SEMI_PBR_GOOD if is_semi else KS_PBR_GOOD
+    roe_min = KS_SEMI_ROE_MIN if is_semi else KS_ROE_MIN
+
     # ── 10점 만점 점수화 ──────────────────────────────────────────
     score = 0
 
     # 가치/안전마진 (최대 3점)
     if pbr is not None:
-        if pbr <= KS_PBR_GOOD:   score += 2
-        elif pbr <= KS_PBR_MAX:  score += 1
+        if pbr <= pbr_good:
+            score += 2
+        elif pbr <= pbr_max:
+            score += 1
     if per is not None and 0 < per <= KS_PER_GOOD:
         score += 1
 
@@ -931,15 +956,17 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
     # ── 필수 탈락 기준 ──────────────────────────────────────────
     financial = fund.get("financial_sector")
     debt_ok  = dte is None or dte <= KS_DEBT_MAX or financial
-    roe_ok   = roe is None or roe >= KS_ROE_MIN
-    pbr_pass = pbr is None or pbr <= KS_PBR_MAX
+    roe_ok   = roe is None or roe >= roe_min
+    pbr_pass = pbr is None or pbr <= pbr_max
     per_pass = per is None or per <= KS_PER_MAX
     qualified = debt_ok and roe_ok and pbr_pass and per_pass
 
     exclude_reason = None
     if   not debt_ok:  exclude_reason = f"부채과다 ({dte:.0f}%)"
     elif not roe_ok:   exclude_reason = f"ROE 부족 ({roe*100:.1f}%)"
-    elif not pbr_pass: exclude_reason = f"PBR 고평가 ({pbr:.2f})"
+    elif not pbr_pass:
+        cap = pbr_max
+        exclude_reason = f"PBR 고평가 ({pbr:.2f}>{cap})"
     elif not per_pass: exclude_reason = f"PER 고평가 ({per:.1f})"
 
     # ── 카테고리 분류 ────────────────────────────────────────────
@@ -965,6 +992,7 @@ def analyze_kospi(ticker: str, name: str, fund: dict,
         "swing_low_20": swing_low_20,
         "score": score, "category": category,
         "qualified": qualified, "exclude_reason": exclude_reason,
+        "semi_sector": is_semi,
         "financial_sector": financial,
         "fund_source": fund.get("source"),
         "vol_intraday": vol_intraday, "regime_ok": regime_ok,
@@ -1120,18 +1148,31 @@ def scan_nasdaq(verbose: bool = True) -> dict:
         print(f"  기준: QQQ 상대강도 · 눌림목(5MA±{PB_5MA_RANGE}%·RSI {PB_RSI_MIN}~{PB_RSI_MAX}·거래량수축)")
         print(f"       돌파(고점{BK_FROM_HIGH}%이내·RSI {BK_RSI_MIN}~{BK_RSI_MAX}·거래량≥{BK_VOL_MIN}x)")
         print(f"       에너지응축(5-20MA≤{SQ_5_20_MAX}%·20일레인지≤{SQ_RANGE_MAX}%·RSI {SQ_RSI_MIN}~{SQ_RSI_MAX})")
-        print(f"       펀더(ROE≥{ND_ROE_MIN*100:.0f}%·성장≥{ND_REV_GROWTH_MIN*100:.0f}%·forwardPEG≤{ND_PEG_MAX}·trailingPER≤{ND_PER_MAX})")
+        print(f"       펀더(ROE≥{ND_ROE_MIN*100:.0f}%·성장≥{ND_REV_GROWTH_MIN*100:.0f}%·forwardPEG≤{ND_PEG_MAX:g}·PER≤{ND_PER_MAX})")
         _sep()
 
     session, crumb = make_session()
     regime = check_regime(NASDAQ_INDEX)
 
     if verbose:
-        flag = "🟢 진입 허용" if regime["ok"] else "🔴 진입 보류"
+        level = regime.get("level", "ok" if regime["ok"] else "off")
+        if level == "ok":
+            flag = "🟢 진입 허용"
+        elif level == "soft":
+            flag = "🟡 제한 허용"
+        else:
+            flag = "🔴 진입 보류"
+        vs = regime.get("vs_50pct")
+        vs_s = f"  50MA대비 {_f(vs * 100 if vs is not None else None, '%', 1)}" if vs is not None else ""
         print(f"  [시장 레짐] QQQ {_f(regime['price'])} / 50MA {_f(regime['ma50'])} "
-              f"→ {regime['reason']}  {flag}  QQQ 20일 {_f(regime['ret_20d'],'%',1)}")
-        if not regime["ok"]:
-            print("  ⚠ QQQ 50MA 이탈 — 후보는 표시하되 실제 진입은 50MA 회복 후 권장.")
+              f"→ {regime['reason']}  {flag}  QQQ 20일 {_f(regime['ret_20d'],'%',1)}{vs_s}")
+        if level == "off":
+            soft_line = (regime["ma50"] * (1 - ND_REGIME_SOFT_PCT)
+                         if regime.get("ma50") else None)
+            print(f"  ⚠ QQQ 50MA 대비 -{ND_REGIME_SOFT_PCT*100:.0f}% "
+                  f"(≈{_f(soft_line)}) 회복 전 — 후보 표시, 실탄 보류.")
+        elif level == "soft":
+            print("  ⚠ 레짐 🟡 — 실탄은 소량·RR≥2·분할만 권장 (50MA 완전 회복 전).")
         _sep()
         print(f"  종목 {len(NASDAQ_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
 
@@ -1198,7 +1239,7 @@ def run_nasdaq():
         print("  (해당 없음)")
 
     print(f"\n  ━━ 기술 통과·펀더 미달 ({len(fund_rejected)}개) ━━")
-    print(f"     차트 조건은 맞지만 ROE·성장·forwardPEG·trailingPER(≤{ND_PER_MAX}) 미충족")
+    print(f"     차트 조건은 맞지만 ROE·성장·forwardPEG·forwardPER(≤{ND_PER_MAX}) 미충족")
     if fund_rejected:
         for a in fund_rejected:
             fail = ",".join(a.get("fund_fail") or ["펀더X"])
@@ -1278,6 +1319,7 @@ def scan_kospi(verbose: bool = True) -> dict:
         _sep()
         print("  코스피 매수 후보발굴 스크리너")
         print(f"  기준: 네이버 금융(PER/PBR/ROE/부채·목표) · 안전마진(PBR≤{KS_PBR_MAX}) · 실적모멘텀(목표가괴리율≥{KS_TGT_GAP*100:.0f}%)")
+        print(f"       반도체·IT부품: PBR≤{KS_SEMI_PBR_MAX} · ROE≥{KS_SEMI_ROE_MIN*100:.0f}% (6종)")
         print(f"       수급전환(기관+외인 {KS_FLOW_DAYS}일·10/20일 누적순매수>0 · 네이버) · 재무안정성(ROE≥{KS_ROE_MIN*100:.0f}%·부채≤{KS_DEBT_MAX}%)")
         print(f"       목표괴리≥{KS_TGT_GAP*100:.0f}%")
         print(f"  점수: 가치(3) + 실적/성장(4) + 수급/기술(3) = 10점 | 우선후보≥7 관찰후보≥5")
@@ -1287,9 +1329,17 @@ def scan_kospi(verbose: bool = True) -> dict:
     regime = check_regime(KOSPI_INDEX)
 
     if verbose:
-        flag = "🟢 강세" if regime["ok"] else "🔴 약세"
+        level = regime.get("level", "ok" if regime["ok"] else "off")
+        if level == "ok":
+            flag = "🟢 강세"
+        elif level == "soft":
+            flag = "🟡 제한"
+        else:
+            flag = "🔴 약세"
         print(f"  [코스피 레짐] KOSPI {_f(regime['price'],nd=0)} / 50MA {_f(regime['ma50'],nd=0)} "
               f"→ {regime['reason']}  {flag}  KOSPI 20일 {_f(regime['ret_20d'],'%',1)}")
+        if level == "soft":
+            print("  ⚠ 레짐 🟡 — 자산 방어: 소량·분할만 권장.")
         _sep()
         print(f"  종목 {len(KOSPI_CANDIDATES)}개 스캔 중 (병렬 {MAX_WORKERS}개)...")
 

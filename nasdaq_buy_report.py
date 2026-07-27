@@ -12,11 +12,59 @@ import re
 from datetime import date
 from pathlib import Path
 
-from screener import scan_nasdaq
+from screener import (
+    ND_PEG_MAX,
+    ND_PER_MAX,
+    ND_REGIME_SOFT_PCT,
+    ND_REV_GROWTH_MIN,
+    ND_ROE_MIN,
+    scan_nasdaq,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_DIR = BASE_DIR / "b_매수후보리스트" / "나스닥"
 HOLDINGS_FILE = BASE_DIR / "보유주식" / "나스닥.md"
+
+# S&P500 GICS 섹터 ETF — 리포트·§1 보완 시 **한글명 (코드)** 형식 사용
+SECTOR_ETF_GLOSSARY: dict[str, tuple[str, str]] = {
+    "XLK": ("기술·반도체", "NVDA·MSFT·AAPL·AI·소프트웨어"),
+    "XLY": ("임의소비·여행", "AMZN·TSLA·여행·숙박·배달·쇼핑"),
+    "XLV": ("헬스케어·바이오", "제약·병원·헬스 IT"),
+    "XLI": ("산업·방산", "항공·물류·방위·기계·HWM"),
+    "XLF": ("금융", "은행·증권·핀테크·SOFI"),
+    "XLC": ("커뮤니케이션", "META·GOOGL·넷플릭스·광고·RDDT"),
+    "XLE": ("에너지", "석유·가스"),
+    "XLP": ("필수소비", "생필품·식품·음료"),
+    "XLU": ("유틸리티", "전력·가스"),
+    "XLRE": ("부동산", "리츠"),
+    "XLB": ("소재", "화학·금속"),
+}
+
+
+def _sector_etf_legend_md() -> list[str]:
+    """§1 섹터 표 하단·용어 설명용."""
+    lines = [
+        "> **섹터 ETF란?** S&P500 업종별 상장지수펀드 코드. "
+        "아래 §1·본문에서는 **한글 섹터명 (코드)** 순으로 씁니다.",
+        "",
+        "| 코드 | 한글 섹터 | 대표 업종 |",
+        "|------|----------|----------|",
+    ]
+    for code, (name, examples) in SECTOR_ETF_GLOSSARY.items():
+        lines.append(f"| {code} | **{name}** | {examples} |")
+    return lines
+
+
+def _sector_section_placeholder() -> list[str]:
+    """§1 AI 보완 전 placeholder + 용어집."""
+    return [
+        "## §1 섹터·자금 흐름 (AI 보완)",
+        "",
+        "*(`/나스닥_매수후보_스크린` ② 단계에서 채움 — 통과 종목 연관 섹터·자금 방향)*",
+        "",
+        *( _sector_etf_legend_md() ),
+        "",
+    ]
 
 
 def _usd(v, nd=0) -> str:
@@ -80,7 +128,8 @@ def _volume_note(a: dict) -> str:
     return "거래량 보통"
 
 
-def classify_candidate(a: dict, levels: dict, regime_ok: bool, owned: set[str]) -> tuple[str, str, str]:
+def classify_candidate(a: dict, levels: dict, regime_ok: bool, owned: set[str],
+                       regime_level: str = "ok") -> tuple[str, str, str]:
     """최종분류, 선정 이유, 미충족 사유."""
     tick = a["ticker"]
     price = a.get("price") or 0
@@ -141,6 +190,8 @@ def classify_candidate(a: dict, levels: dict, regime_ok: bool, owned: set[str]) 
 
     if not regime_ok:
         reasons_bad.append("QQQ 레짐 약세")
+    elif regime_level == "soft":
+        reasons_bad.append(f"레짐 🟡 제한 허용(소량·RR≥2, 50MA -{ND_REGIME_SOFT_PCT*100:.0f}% 이내)")
 
     vol_note = _volume_note(a)
     vol_ok = (
@@ -209,12 +260,14 @@ def _sort_passed(candidates: list[dict]) -> list[dict]:
 
 
 def enrich_scan(scan: dict, owned: set[str]) -> list[dict]:
-    regime_ok = scan["regime"]["ok"]
+    regime = scan["regime"]
+    regime_ok = regime["ok"]
+    regime_level = regime.get("level", "ok" if regime_ok else "off")
     out = []
     for a in scan["passed"]:
         levels = compute_trade_levels(a)
         classification, pick_reason, miss_reason = classify_candidate(
-            a, levels, regime_ok, owned,
+            a, levels, regime_ok, owned, regime_level,
         )
         out.append({
             "a": a,
@@ -272,8 +325,16 @@ def _detail_block(item: dict, owned: set[str], rank_note: str = "") -> str:
 def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> str:
     today = date.today().isoformat()
     regime = scan["regime"]
-    regime_flag = "🟢 진입 허용" if regime["ok"] else "🔴 진입 보류"
-    regime_word = "강세" if regime["ok"] else "약세 (50MA 이탈)"
+    level = regime.get("level", "ok" if regime["ok"] else "off")
+    if level == "ok":
+        regime_flag = "🟢 진입 허용"
+        regime_word = "강세 (50MA 위)"
+    elif level == "soft":
+        regime_flag = "🟡 제한 허용"
+        regime_word = f"제한 허용 (50MA -{ND_REGIME_SOFT_PCT*100:.0f}% 이내)"
+    else:
+        regime_flag = "🔴 진입 보류"
+        regime_word = "약세 (50MA 이탈)"
 
     groups = {
         "우선 검토": [],
@@ -331,11 +392,23 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         f"(펀더 통과 **{len(candidates)}**종목) |",
         "",
     ]
-    if not regime["ok"]:
-        lines.append(f"> ⚠ QQQ 50MA({_usd(regime['ma50'], 0)}) 회복 전까지 **실탄 매수 보류**. "
-                     "아래는 대기·재검토 리스트.")
+    if level == "off":
+        soft_px = (regime["ma50"] * (1 - ND_REGIME_SOFT_PCT)
+                   if regime.get("ma50") else None)
+        lines.append(
+            f"> ⚠ QQQ 50MA 대비 -{ND_REGIME_SOFT_PCT*100:.0f}% "
+            f"(≈{_usd(soft_px, 0)}) 회복 전까지 **실탄 매수 보류**. "
+            "아래는 대기·재검토 리스트."
+        )
+        lines.append("")
+    elif level == "soft":
+        lines.append(
+            "> ⚠ 레짐 **🟡 제한 허용** — 실탄은 **소량·RR≥2·분할**만 권장. "
+            "50MA 완전 회복 전엔 추격·풀베팅 금지."
+        )
         lines.append("")
 
+    lines.extend(_sector_section_placeholder())
     lines.extend([
         "---",
         "",
@@ -355,11 +428,12 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
             f"{c['classification']}{owned_mark} |"
         )
 
+    flag_emoji = {"ok": "🟢", "soft": "🟡", "off": "🔴"}.get(level, "🔴")
     lines.extend([
         "",
         f"**우선 검토(§1: RR≥2·정배열·RS·거래량): {len(priority)}종목**"
-        f" — 레짐 {'🟢' if regime['ok'] else '🔴'}"
-        f" + RR 2 미달 다수" if len(priority) == 0 else "",
+        f" — 레짐 {flag_emoji}"
+        + (" + RR 2 미달 다수" if len(priority) == 0 else ""),
     ])
     if watch_line:
         lines.append(watch_line)
@@ -415,10 +489,11 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         f"| 진입유형 | 눌림목 / 돌파 / 에너지응축 | {fund_ok_n}/{fund_ok_n} ✅ |",
         f"| RS | QQQ 대비 20일 우위 | "
         f"{sum(1 for c in candidates if c['a'].get('rs_ok'))}/{fund_ok_n} ✅ |",
-        f"| 펀더 | ROE≥7% · 성장≥5% · **fwd PEG≤2.5** · trail PER≤80 | {fund_ok_n}/{fund_ok_n} ✅ |",
+        f"| 펀더 | ROE≥{ND_ROE_MIN*100:.0f}% · 성장≥{ND_REV_GROWTH_MIN*100:.0f}% · "
+        f"**fwd PEG≤{ND_PEG_MAX:g}** · PER≤{ND_PER_MAX} | {fund_ok_n}/{fund_ok_n} ✅ |",
         f"| **최종분류 RR≥2** | 애널 목표·손절 기준 | **{rr2_count}/{fund_ok_n}** |",
-        f"| **레짐** | QQQ > 50MA | "
-        f"{'✅' if regime['ok'] else '❌'} |",
+        f"| **레짐** | QQQ > 50MA (🟡 -{ND_REGIME_SOFT_PCT*100:.0f}% 이내 허용) | "
+        f"{'✅' if level == 'ok' else ('🟡' if level == 'soft' else '❌')} |",
         "",
         f"{scan['tech_passed_count']}종목 기술 통과 → "
         f"펀더 미달 {len(scan['fund_rejected'])}종목 → **{fund_ok_n}종목**",
@@ -445,13 +520,27 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
             lines.append(f"| … | | 외 {len(scan['fund_rejected']) - 15}종목 |")
         lines.append("")
 
+    if level == "off":
+        soft_px = (regime["ma50"] * (1 - ND_REGIME_SOFT_PCT)
+                   if regime.get("ma50") else None)
+        action1 = (
+            f"1. **QQQ ≈{_usd(soft_px, 0)}(50MA -{ND_REGIME_SOFT_PCT*100:.0f}%)** "
+            f"회복 → 🟡 제한 허용 / **{_usd(regime['ma50'], 0)}(50MA)** → 🟢"
+        )
+    elif level == "soft":
+        action1 = (
+            f"1. **레짐 🟡** — 소량·RR≥2만. "
+            f"**QQQ {_usd(regime['ma50'], 0)}(50MA)** 회복 시 🟢 정상 허용"
+        )
+    else:
+        action1 = f"1. **레짐 🟢** 유지 — QQQ {_usd(regime['ma50'], 0)}(50MA) 위"
+
     lines.extend([
         "---",
         "",
         "## 다음 액션",
         "",
-        f"1. **QQQ {_usd(regime['ma50'], 0)}(50MA) 회복** → 레짐 "
-        f"{'🟢' if regime['ok'] else '확인'}",
+        action1,
     ])
     if new_watch:
         top = new_watch[0]

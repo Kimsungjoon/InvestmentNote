@@ -12,7 +12,14 @@ import re
 from datetime import date
 from pathlib import Path
 
-from screener import scan_kospi
+from screener import (
+    KS_PBR_MAX,
+    KS_ROE_MIN,
+    KS_SEMI_PBR_GOOD,
+    KS_SEMI_PBR_MAX,
+    KS_SEMI_ROE_MIN,
+    scan_kospi,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_DIR = BASE_DIR / "b_매수후보리스트" / "코스피"
@@ -86,9 +93,13 @@ def classify_candidate(a: dict, levels: dict, owned: set[str]) -> tuple[str, str
     score = a.get("score", 0)
     cat = a.get("category")
 
-    if a.get("pbr") is not None and a["pbr"] <= 1.0:
+    if a.get("pbr") is not None and a["pbr"] <= (
+        KS_SEMI_PBR_GOOD if a.get("semi_sector") else 1.0
+    ):
         reasons_good.append(f"PBR {_num(a['pbr'], 2)}")
-    elif a.get("pbr") is not None and a["pbr"] <= 1.5:
+    elif a.get("pbr") is not None and a["pbr"] <= (
+        KS_SEMI_PBR_MAX if a.get("semi_sector") else KS_PBR_MAX
+    ):
         reasons_good.append(f"PBR {_num(a['pbr'], 2)}")
 
     tg = a.get("tgt_gap")
@@ -288,6 +299,8 @@ def generate_markdown(
         "> 데이터: **네이버 금융** 우선 (Yahoo는 누락 필드만 보완) · 차트는 Yahoo",
         ">",
         "> 전략: **가치투자 + 자산 방어** | 장기 보유·저평가 우량주",
+        f"> **반도체·IT부품(6종):** PBR≤{KS_SEMI_PBR_MAX} · ROE≥{KS_SEMI_ROE_MIN*100:.0f}% "
+        f"| **일반:** PBR≤{KS_PBR_MAX} · ROE≥{KS_ROE_MIN*100:.0f}%",
         "",
         "---",
         "",
@@ -319,10 +332,11 @@ def generate_markdown(
             tg = f"+{a['tgt_gap']*100:.0f}%" if a.get("tgt_gap") else "N/A"
             flow = "▲" if a.get("flow_ok") else "▼"
             owned_mark = " *(보유)*" if a["ticker"] in owned or code in owned else ""
+            semi_mark = " *(반도체)*" if a.get("semi_sector") and not owned_mark else ""
             lines.append(
                 f"| {i} | {a['name']} | {code} | **{a.get('score')}/10** | "
                 f"{_num(a.get('pbr'), 2)} | {tg} | {flow} | "
-                f"{_rr_str(c['levels']['rr'])} | {c['classification']}{owned_mark} |"
+                f"{_rr_str(c['levels']['rr'])} | {c['classification']}{owned_mark}{semi_mark} |"
             )
 
         watch_line = ""
@@ -379,9 +393,11 @@ def generate_markdown(
         "",
         "| 게이트 | 기준 | 통과 |",
         "|--------|------|------|",
-        f"| 재무 | ROE≥7% · 부채≤200% · PBR≤1.5 · PER≤22 | "
+        f"| 재무(일반) | ROE≥{KS_ROE_MIN*100:.0f}% · 부채≤200% · PBR≤{KS_PBR_MAX} · PER≤22 | "
         f"{sum(1 for a in scan['results'] if a.get('qualified'))}/"
         f"{len(scan['results'])} |",
+        f"| 재무(반도체) | ROE≥{KS_SEMI_ROE_MIN*100:.0f}% · PBR≤{KS_SEMI_PBR_MAX} · PER≤22 | "
+        f"{sum(1 for a in scan['results'] if a.get('qualified') and a.get('semi_sector'))}/6 |",
         f"| 스크리너 점수 7+ | 우선 후보 | {len(scan['priority'])} |",
         f"| 스크리너 점수 5~6 | 관찰 후보 | {len(scan['watchlist'])} |",
         f"| **최종 우선 검토** | 점수7+ · 수급▲ | **{len(priority)}** |",

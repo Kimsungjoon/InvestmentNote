@@ -17,10 +17,7 @@ IS_CI = os.environ.get("CI", "false").lower() == "true"
 #   stop_price   : 20일 ATR 고려, 추세가 꺾였다고 판단되는 손절 가격
 #                  (일시적 흔들림엔 견디되 지지선·주요 이평선 이탈 시 청산)
 # 추세가 진행되면 stop_price를 지지선 상향에 맞춰 올려 관리한다(트레일).
-PORTFOLIO = [
-    {"name": "하우멧 에어로스페이스", "ticker": "HWM",  "avg_price": 279.5975,
-     "stop_price": 252.0, "target_price": 315.0, "qty": 12, "buy_date": "2026-07-07"},
-]
+PORTFOLIO = []
 
 # 매도 알림에서 제외할 티커
 ALERT_EXCLUDE = set()
