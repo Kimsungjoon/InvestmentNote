@@ -35,6 +35,10 @@ ND_PEG_MAX         = 3.0    # PEG 상한 — forward PER 우선, 없으면 trail
 ND_PER_MAX         = 100    # PER 절대 상한 — forward 우선, 없으면 trailing (성장주 trailing 부풀림 완화)
 ND_REGIME_SOFT_PCT = 0.05   # 레짐 🟡: 50MA 대비 -5% 이내까지 제한 허용 (우상향 조건 폐지)
 
+# ── 목표가 산정 (C방식: 기술적·밸류에이션 목표 중 보수적 값 + 애널 median 참고) ──
+ND_FAIR_PEG     = 2.0   # 밸류에이션 목표: 적정 forward PEG (성장주 상한 여유). 목표 = 현재가 × ND_FAIR_PEG / fwdPEG
+ND_TGT_ATR_MULT = 3.0   # 기술적 목표: 현재가 + N×ATR20 (2주~2개월 스윙 측정된 이동폭)
+
 # ── 눌림목: 상승추세 + 5/20MA 근처 조정 + 거래량 수축 ──
 PB_5MA_RANGE  = 2.5     # 5MA 이격 ±2.5% 이내
 PB_FROM_20MA  = 4.0     # 20MA 아래 최대 -4%까지 허용
@@ -356,6 +360,9 @@ def fetch_fundamentals(session, crumb, ticker: str) -> dict:
             "forward_per":   forward_per,
             "pbr":           pbr,
             "target_mean":   raw(fd, "targetMeanPrice"),
+            "target_median": raw(fd, "targetMedianPrice"),
+            "target_low":    raw(fd, "targetLowPrice"),
+            "target_high":   raw(fd, "targetHighPrice"),
         }
     except Exception:
         return {}
@@ -780,6 +787,13 @@ def analyze_nasdaq(ticker: str, name: str, cap: float | None,
     range_20d   = ((max(recent_20) - min(recent_20)) / price * 100) if price else None
     ret_stock   = ret_nd(closes, 20)
 
+    # ATR 프록시: 종가 기반 20일 평균 절대변동폭 (fetch_daily는 고가/저가 미제공)
+    if len(closes) >= 21:
+        _diffs = [abs(closes[i] - closes[i - 1]) for i in range(-20, 0)]
+        atr_20 = sum(_diffs) / len(_diffs)
+    else:
+        atr_20 = None
+
     ext_5ma   = ((price - ma5) / ma5 * 100)    if ma5  else None
     ext_20ma  = ((price - ma20) / ma20 * 100)  if ma20 else None
     ext_5_20  = ((ma5 - ma20)  / ma20 * 100)   if (ma5 and ma20)  else None
@@ -867,7 +881,11 @@ def analyze_nasdaq(ticker: str, name: str, cap: float | None,
         "profit_margin": fund.get("profit_margin"),
         "per": fund.get("per"), "forward_per": fund.get("forward_per"),
         "target_mean": fund.get("target_mean"),
+        "target_median": fund.get("target_median"),
+        "target_low": fund.get("target_low"),
+        "target_high": fund.get("target_high"),
         "swing_low_20": swing_low_20,
+        "high_52w": high_52w, "atr_20": atr_20,
         "vol_intraday": vol_intraday,
     }
 

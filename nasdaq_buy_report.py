@@ -13,11 +13,13 @@ from datetime import date
 from pathlib import Path
 
 from screener import (
+    ND_FAIR_PEG,
     ND_PEG_MAX,
     ND_PER_MAX,
     ND_REGIME_SOFT_PCT,
     ND_REV_GROWTH_MIN,
     ND_ROE_MIN,
+    ND_TGT_ATR_MULT,
     scan_nasdaq,
 )
 
@@ -53,6 +55,100 @@ def _sector_etf_legend_md() -> list[str]:
     for code, (name, examples) in SECTOR_ETF_GLOSSARY.items():
         lines.append(f"| {code} | **{name}** | {examples} |")
     return lines
+
+
+def _top_pick(candidates: list[dict], owned: set[str]) -> dict | None:
+    """초보 요약용 대표 1종목 — 우선 검토 우선, 없으면 관찰(미보유)."""
+    for want in ("우선 검토", "관찰 필요"):
+        for c in candidates:
+            if c["classification"] == want and c["a"]["ticker"] not in owned:
+                return c
+    return None
+
+
+def _beginner_summary(scan: dict, candidates: list[dict], owned: set[str],
+                      level: str) -> list[str]:
+    """리포트 맨 위 초보용 한눈 요약 — 지금 시장·오늘 할 일·관심 종목."""
+    regime = scan["regime"]
+    vs50 = None
+    if regime.get("price") and regime.get("ma50"):
+        vs50 = (regime["price"] - regime["ma50"]) / regime["ma50"] * 100
+
+    if level == "ok":
+        market = "🟢 **시장이 튼튼해요(상승 흐름).** 조건 맞는 종목은 조금씩 사도 되는 때예요."
+        todo = "좋은 종목을 **소량부터** 매수 검토. 단, 아래 표에서 손익비(RR)가 2 이상인 것만."
+    elif level == "soft":
+        market = "🟡 **시장이 살짝 약해요.** 완전히 나쁜 건 아니지만 조심할 구간이에요."
+        todo = "사더라도 **아주 조금만**, 한 번에 다 넣지 말고 나눠서. 손익비 좋은 것만."
+    else:
+        market = ("🔴 **시장이 약해요(하락 흐름).** 지금은 새로 사기보다 "
+                  "**현금 들고 기다리기**가 안전해요.")
+        todo = "**신규 매수 보류.** 지수(QQQ)가 회복될 때까지 관망하고, 아래는 미리 봐두는 후보예요."
+
+    lines = [
+        "## 📌 초보용 한눈 요약",
+        "",
+        f"- **지금 시장:** {market}",
+    ]
+    if vs50 is not None:
+        lines.append(
+            f"  - 쉽게: 미국 기술주 대표지수(QQQ)가 50일 평균가격선보다 "
+            f"**{vs50:+.1f}%** 위치예요. (0%보다 아래면 약세)"
+        )
+    lines.append(f"- **오늘 할 일:** {todo}")
+
+    pick = _top_pick(candidates, owned)
+    if pick:
+        a = pick["a"]
+        lv = pick["levels"]
+        lines.append(
+            f"- **가장 눈여겨볼 종목:** {a['name']} ({a['ticker']}) — "
+            f"현재가 {_usd(a.get('price'), 2)}, 손익비(RR) {_rr_str(lv.get('rr'))}."
+        )
+        lines.append(
+            f"  - 사면 목표 {_usd(lv.get('target'))} / 손절(방어선) {_usd(lv.get('stop'))}. "
+            "**단, 위 '지금 시장'이 🔴이면 지금은 사지 말고 기다리세요.**"
+        )
+    else:
+        lines.append("- **가장 눈여겨볼 종목:** 오늘은 바로 살 만한 종목이 없어요. 관망.")
+
+    if owned:
+        lines.append(f"- **내 보유:** {', '.join(sorted(owned))} — 손절·목표가는 그대로 유지.")
+    else:
+        lines.append("- **내 보유:** 없음 (전액 현금).")
+
+    lines.extend([
+        "",
+        "> 손익비(RR)가 뭔지 등 용어는 맨 아래 **『🔤 용어 쉽게 풀이』** 참고.",
+        "",
+        "---",
+        "",
+    ])
+    return lines
+
+
+def _glossary_section() -> list[str]:
+    """리포트 맨 아래 초보용 용어 풀이."""
+    return [
+        "---",
+        "",
+        "## 🔤 용어 쉽게 풀이",
+        "",
+        "| 용어 | 쉽게 말하면 |",
+        "|------|-------------|",
+        "| **QQQ** | 미국 기술주 100개를 묶은 대표 지수. '시장 전체 분위기' 온도계. |",
+        "| **50MA(50일선)** | 최근 50일 평균 가격. 주가가 이 위면 상승세, 아래면 약세로 봄. |",
+        "| **레짐(🟢🟡🔴)** | 지금이 살 때인지 기다릴 때인지 신호등. 🟢 사도 됨 / 🟡 조심 / 🔴 기다리기. |",
+        "| **정배열** | 단기·중기·장기 평균선이 위→아래로 가지런한 상태 = 건강한 상승 추세. |",
+        "| **RS(상대강도)** | 시장 평균보다 더 잘 버티거나 오르는 힘. ▲면 시장보다 강함. |",
+        "| **RSI** | 0~100 과열·침체 지표. 너무 높으면(80+) 과열, 낮으면 눌린 상태. |",
+        "| **PER / PEG** | PER=주가가 이익의 몇 배인지. PEG=그걸 성장속도로 나눈 값(낮을수록 저평가). |",
+        "| **RR(손익비)** | **벌 수 있는 돈 ÷ 잃을 수 있는 돈.** 2면 '2 벌고 1 잃는' 구조. 클수록 좋음. |",
+        "| **목표 / 손절** | 목표=팔아서 이익 볼 가격. 손절=여기 깨지면 손해 보고 파는 방어선. |",
+        "| **ATR** | 하루 평균 움직이는 폭. 목표·손절 간격을 정할 때 씀. |",
+        "| **눌림목/돌파/에너지응축** | 사기 좋은 자리 유형. 눌림목=잠깐 쉬는 자리, 돌파=고점 뚫기, 응축=힘 모으는 자리. |",
+        "",
+    ]
 
 
 def _sector_section_placeholder() -> list[str]:
@@ -94,15 +190,79 @@ def load_owned_tickers() -> set[str]:
     return {m.group(1) for m in re.finditer(r"\|\s*[^|]+\|\s*([A-Z]{1,5})\s*\|", text)}
 
 
+def _target_technical(a: dict) -> float | None:
+    """기술적 목표 = max(52주 고점 저항, 현재가 + N×ATR 측정이동).
+
+    - 눌림목/응축: 전고점(52주 고점)이 1차 저항·목표.
+    - 돌파(고점 근접): 전고점이 현재가와 가까워 ATR 측정이동이 목표를 만든다.
+    """
+    price = a.get("price")
+    if not price:
+        return None
+    cands = []
+    high_52w = a.get("high_52w")
+    if high_52w and high_52w > price:
+        cands.append(high_52w)
+    atr = a.get("atr_20")
+    if atr and atr > 0:
+        cands.append(price + ND_TGT_ATR_MULT * atr)
+    return max(cands) if cands else None
+
+
+def _target_valuation(a: dict) -> float | None:
+    """밸류에이션 목표 = 적정 forward PEG(ND_FAIR_PEG) 도달 시 주가.
+
+    목표 = 현재가 × ND_FAIR_PEG / fwdPEG  (fwdPEG = forwardPER ÷ 성장%)
+    fwdPEG 없으면 trailing PEG 사용, 둘 다 없으면 None.
+    """
+    price = a.get("price")
+    peg = a.get("peg_forward") or a.get("peg_trailing")
+    if not price or not peg or peg <= 0:
+        return None
+    return price * ND_FAIR_PEG / peg
+
+
 def compute_trade_levels(a: dict) -> dict:
+    """C방식 목표가: 기술·밸류 목표 중 보수적(min) 채택, 애널 median은 참고.
+
+    - 손절 = min(50MA, 20일 스윙저점) × 0.98
+    - 목표 = min(기술적 목표, 밸류에이션 목표)  (사용 가능한 것만)
+    - 애널 목표(median 우선, 없으면 mean)는 참고·교차검증용
+    - RR = (목표 − 현재) ÷ (현재 − 손절)
+    """
     price = a.get("price")
     supports = [x for x in (a.get("ma50"), a.get("swing_low_20")) if x]
     stop = min(supports) * 0.98 if supports else None
-    target = a.get("target_mean")
+
+    t_tech = _target_technical(a)
+    t_val = _target_valuation(a)
+    t_analyst = a.get("target_median") or a.get("target_mean")
+
+    # 밸류 목표가 현재가 아래 = 이미 적정가 위(고평가). 추세추종 1순위이므로
+    # 제외하지 않고 기술적 목표를 쓰되 '고평가 주의' 플래그만 단다.
+    overvalued = bool(t_val and price and t_val < price)
+
+    if t_tech is not None and t_val is not None and not overvalued:
+        target = min(t_tech, t_val)              # 밸류가 상단 캡 (보수적 min)
+        target_src = "밸류" if target == t_val else "기술"
+    elif t_tech is not None:
+        target = t_tech                          # 기술 목표 (고평가 시에도 유지)
+        target_src = "기술"
+    elif t_val is not None:
+        target = t_val
+        target_src = "밸류"
+    else:
+        target = t_analyst
+        target_src = "애널" if t_analyst else None
+
     rr = None
     if price and stop and target and price > stop:
         rr = (target - price) / (price - stop)
-    return {"stop": stop, "target": target, "rr": rr}
+    return {
+        "stop": stop, "target": target, "rr": rr, "target_src": target_src,
+        "t_tech": t_tech, "t_val": t_val, "t_analyst": t_analyst,
+        "overvalued": overvalued,
+    }
 
 
 def _peg_label(a: dict) -> tuple[str, str]:
@@ -161,7 +321,10 @@ def classify_candidate(a: dict, levels: dict, regime_ok: bool, owned: set[str],
     good = " · ".join(reasons_good) if reasons_good else "펀더·기술 통과"
 
     if target and price and target < price * 0.99:
-        msg = f"애널 목표 {_usd(target)} < 현재 {_usd(price)}"
+        src = levels.get("target_src") or "목표"
+        src_label = {"밸류": "밸류에이션 목표(고평가)", "기술": "기술적 목표",
+                     "애널": "애널 목표"}.get(src, "목표")
+        msg = f"{src_label} {_usd(target)} < 현재 {_usd(price)}"
         if rr is not None:
             msg += f"(RR {rr:.1f})"
         return "제외", msg, msg
@@ -200,6 +363,9 @@ def classify_candidate(a: dict, levels: dict, regime_ok: bool, owned: set[str],
     )
     if not vol_ok and a.get("entry_type") == "눌림목":
         reasons_bad.append(vol_note)
+
+    if levels.get("overvalued") and levels.get("t_val"):
+        reasons_bad.append(f"밸류 고평가(적정 {_usd(levels['t_val'])})")
 
     per = a.get("per")
     if per is not None and per > 60:
@@ -241,6 +407,31 @@ def _rr_str(rr) -> str:
     if abs(rr) < 0.05:
         return "≈0"
     return f"{rr:.1f}"
+
+
+def _src_tag(lv: dict) -> str:
+    src = lv.get("target_src")
+    return f" ({src})" if src else ""
+
+
+def _target_breakdown(lv: dict) -> str:
+    """기술·밸류·애널 3목표 + 채택 근거."""
+    val_str = _usd(lv.get("t_val"))
+    if lv.get("overvalued"):
+        val_str += " ⚠고평가"
+    parts = [
+        f"기술 {_usd(lv.get('t_tech'))}",
+        f"밸류 {val_str}",
+        f"애널 {_usd(lv.get('t_analyst'))}",
+    ]
+    src = lv.get("target_src")
+    if not src:
+        tail = ""
+    elif lv.get("overvalued"):
+        tail = f" → **{src} 채택**(밸류 현재가 아래 → 캡 미적용)"
+    else:
+        tail = f" → **{src} 채택**(보수적 min)"
+    return " · ".join(parts) + tail
 
 
 def _sort_passed(candidates: list[dict]) -> list[dict]:
@@ -301,7 +492,9 @@ def _detail_block(item: dict, owned: set[str], rank_note: str = "") -> str:
         f"{_num(a.get('forward_per'), 0)} / {peg_disp} |",
         f"| ROE / 성장 / 부채 | {_num(a.get('roe'), 0, 100)}% / "
         f"{_num(a.get('rev_growth'), 0, 100)}% / {_num(a.get('debt_equity'), 0)}% |",
-        f"| 손절 / 목표 / RR | {_usd(lv['stop'])} / {_usd(lv['target'])} / **{_rr_str(lv['rr'])}** |",
+        f"| 손절 / 목표 / RR | {_usd(lv['stop'])} / {_usd(lv['target'])}"
+        f"{_src_tag(lv)} / **{_rr_str(lv['rr'])}** |",
+        f"| 목표근거 | {_target_breakdown(lv)} |",
         "",
         f"**후보 선정 이유:** {item['pick_reason']}.",
         "",
@@ -376,6 +569,10 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         f"> 스캔: `python3 screener.py --report` ({scan['universe_size']}종목, {today} 실행)",
         ">",
         "> 전략: **추세추종 + 단기 스윙** | 보유 2주~2개월",
+        ">",
+        f"> **목표가 산정(C방식):** 기술적 목표(전고점·현재가+{ND_TGT_ATR_MULT:g}×ATR20)와 "
+        f"밸류에이션 목표(적정 fwdPEG {ND_FAIR_PEG:g} 도달가) 중 **보수적 값(min)** 채택. "
+        "애널리스트 목표(median)는 **참고·교차검증**용. RR = (목표−현재)÷(현재−손절).",
         "",
         "---",
         "",
@@ -408,6 +605,7 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         )
         lines.append("")
 
+    lines.extend(_beginner_summary(scan, candidates, owned, level))
     lines.extend(_sector_section_placeholder())
     lines.extend([
         "---",
@@ -491,7 +689,7 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         f"{sum(1 for c in candidates if c['a'].get('rs_ok'))}/{fund_ok_n} ✅ |",
         f"| 펀더 | ROE≥{ND_ROE_MIN*100:.0f}% · 성장≥{ND_REV_GROWTH_MIN*100:.0f}% · "
         f"**fwd PEG≤{ND_PEG_MAX:g}** · PER≤{ND_PER_MAX} | {fund_ok_n}/{fund_ok_n} ✅ |",
-        f"| **최종분류 RR≥2** | 애널 목표·손절 기준 | **{rr2_count}/{fund_ok_n}** |",
+        f"| **최종분류 RR≥2** | 목표(기술·밸류 min)·손절 기준 | **{rr2_count}/{fund_ok_n}** |",
         f"| **레짐** | QQQ > 50MA (🟡 -{ND_REGIME_SOFT_PCT*100:.0f}% 이내 허용) | "
         f"{'✅' if level == 'ok' else ('🟡' if level == 'soft' else '❌')} |",
         "",
@@ -558,6 +756,8 @@ def generate_markdown(scan: dict, candidates: list[dict], owned: set[str]) -> st
         tickers = "·".join(c["a"]["ticker"] for c in weak[:4])
         lines.append(f"4. {tickers} — **RR·목표가 개선** 전까지 관망")
     lines.append("")
+
+    lines.extend(_glossary_section())
 
     return "\n".join(lines)
 

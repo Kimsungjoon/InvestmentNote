@@ -217,6 +217,84 @@ def enrich_scan(scan: dict, owned: set[str]) -> tuple[list[dict], list[dict], li
     return passed_items, weak_items, excluded_items
 
 
+def _top_pick(passed: list[dict], owned: set[str]) -> dict | None:
+    """초보 요약용 대표 1종목 — 우선 검토 우선, 없으면 관찰(미보유)."""
+    for want in ("우선 검토", "관찰 필요"):
+        for c in passed:
+            tick = c["a"]["ticker"]
+            if c["classification"] == want and tick not in owned \
+                    and _ticker_code(tick) not in owned:
+                return c
+    return None
+
+
+def _beginner_summary(scan: dict, passed: list[dict], owned: set[str]) -> list[str]:
+    """리포트 맨 위 초보용 한눈 요약 — 코스피(가치투자·자산방어) 눈높이."""
+    regime = scan["regime"]
+    ok = regime["ok"]
+
+    if ok:
+        market = "🟢 **코스피가 상승세예요(50일 평균선 위).** 저평가 우량주를 차분히 볼 만한 때."
+        todo = "급하게 사지 말고, **싸고 튼튼한 회사**를 골라 조금씩 모아가기."
+    else:
+        market = ("🔴 **코스피가 약해요(50일 평균선 아래).** 코스피 계좌는 "
+                  "'돈 지키기'가 1순위라 더 신중할 때예요.")
+        todo = "**서두르지 않기.** 지수가 회복될 때까지 기다리고, 아래는 미리 봐두는 후보예요."
+
+    lines = [
+        "## 📌 초보용 한눈 요약",
+        "",
+        f"- **지금 시장:** {market}",
+        f"- **오늘 할 일:** {todo}",
+        "- **이 계좌 성격:** 미국(나스닥)과 달리 **가치투자·자산 방어**예요. "
+        "짧게 사고파는 게 아니라 **싸고 좋은 회사를 오래** 들고 가는 방식.",
+    ]
+
+    pick = _top_pick(passed, owned)
+    if pick:
+        a = pick["a"]
+        lines.append(
+            f"- **가장 눈여겨볼 종목:** {a['name']} ({_ticker_code(a['ticker'])}) — "
+            f"현재가 {_krw(a.get('price'))}, 스크리너 점수 {a.get('score', 0)}/10점."
+        )
+        lines.append(
+            "  - 쉽게: 재무가 튼튼하고 저평가 신호가 나온 회사예요. "
+            "**단, 위 '지금 시장'이 🔴이면 지금 사기보다 관찰만 하세요.**"
+        )
+    else:
+        lines.append("- **가장 눈여겨볼 종목:** 오늘은 바로 살 만한 종목이 없어요. 관망.")
+
+    lines.extend([
+        "",
+        "> PBR·목표괴리 같은 용어는 맨 아래 **『🔤 용어 쉽게 풀이』** 참고.",
+        "",
+    ])
+    return lines
+
+
+def _glossary_section() -> list[str]:
+    """리포트 맨 아래 초보용 용어 풀이 — 코스피(가치투자)."""
+    return [
+        "---",
+        "",
+        "## 🔤 용어 쉽게 풀이",
+        "",
+        "| 용어 | 쉽게 말하면 |",
+        "|------|-------------|",
+        "| **KOSPI 50MA** | 코스피 지수의 최근 50일 평균. 이 위면 상승세, 아래면 약세. |",
+        "| **PBR** | 회사 순자산 대비 주가. **1보다 낮으면** 자산보다 싸게 거래 = 저평가 신호. |",
+        "| **PER** | 주가가 이익의 몇 배인지. 낮을수록 이익 대비 싸다는 뜻. |",
+        "| **ROE** | 회사가 자기 돈으로 돈 버는 효율. **높을수록** 잘 버는 회사. |",
+        "| **목표괴리** | 증권사 목표가가 지금 주가보다 얼마나 위인지. +20%면 20% 더 오를 여지로 봄. |",
+        "| **수급(기관·외인)** | 큰손(기관·외국인)이 사는 중(▲)인지 파는 중(▼)인지. ▲면 긍정적. |",
+        "| **스크리너 점수** | 밸류·수급·실적을 종합한 10점 만점 점수. 높을수록 조건이 좋음. |",
+        "| **RR(손익비)** | **벌 수 있는 돈 ÷ 잃을 수 있는 돈.** 클수록 유리. |",
+        "| **목표 / 방어선(손절)** | 목표=이익 실현 가격. 방어선=여기 깨지면 손해 줄이고 파는 선. |",
+        "| **안전마진** | 회사 실제 가치보다 싸게 사서 확보하는 '여유분'. 가치투자의 핵심. |",
+        "",
+    ]
+
+
 def _detail_block(item: dict, owned: set[str], rank_note: str = "") -> str:
     a = item["a"]
     lv = item["levels"]
@@ -316,6 +394,8 @@ def generate_markdown(
         f"조건 미달 **{len(scan['weak'])}** · 제외 **{len(scan['excluded'])}** |",
         "",
     ]
+
+    lines.extend(_beginner_summary(scan, passed, owned))
 
     if passed:
         lines.extend([
@@ -423,6 +503,8 @@ def generate_markdown(
             f"— 5일 기관·외인 순매수 유지 확인"
         )
     lines.append("")
+
+    lines.extend(_glossary_section())
 
     return "\n".join(lines)
 
